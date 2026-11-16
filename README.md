@@ -33,7 +33,27 @@ Every 5 seconds, into `data/monitor.db` (SQLite, gitignored, pruned to 7 days):
 - Disk read / write throughput, network bytes in / out per interface
 - Every 30 seconds: free space per volume, `pmset -g therm`
 
+Every 10 seconds, from a separate thread that can never hold up the sampler:
+
+- Ping (4 packets each) to the router and to two public IPs, 1.1.1.1 and
+  8.8.8.8: latency min / avg / max, jitter and loss per target
+- A DNS lookup sent straight to the configured resolvers, so it is never
+  answered from this Mac's cache
+- Link: interface, Wi-Fi or Ethernet, and for Wi-Fi the signal, noise and tx rate
+- Every 60 seconds: one small HTTPS request to Apple's connectivity check page
+
 A week of history is roughly 200 MB.
+
+## Internet
+
+The Internet tile gives a plain verdict. When both public IPs stop answering it
+says where the break is: "router reachable, ISP side" or "router unreachable
+(Wi-Fi or local network)". The chart shows latency per target with loss and
+outages shaded, and a summary for the selected range: uptime, outages, median
+and worst latency, loss.
+
+"Run speed test" runs macOS's `networkQuality` once (about 20 s, roughly 200 MB
+of data). It only ever runs when clicked.
 
 ## Events
 
@@ -43,6 +63,10 @@ An event row is written, with the process lists at that moment, when:
 |---|---|
 | Load above core count | 1-minute load average above the core count for 60 s (warning); raised to critical once it has stayed above 2x the core count for 60 s. Closes when load falls below 0.9x the core count |
 | Memory pressure | kernel pressure level warn or critical |
+| Internet down | both public IPs unreachable for 20 s; the title says which side of the router the break is on |
+| Packet loss | 10% or more over 60 s while up (closes under 3%) |
+| High latency / unsteady | median ping above 150 ms, or jitter above 50 ms, over 60 s |
+| DNS failing / slow | half the lookups failing, or median above 500 ms, over 60 s while pings are fine |
 | Swap growing | swap used up 256 MB within 60 s |
 | Disk low | a volume under 10% free |
 | CPU throttled | `CPU_Speed_Limit` below 100 |
@@ -57,6 +81,7 @@ lower line). High CPU % on its own is not an event. The thresholds are constants
     /api/history?range=1h            15m | 1h | 6h | 24h | 7d, downsampled to ~360 points
     /api/history?range=1h&end=TS     the window ending at a unix time
     /api/events?limit=100&since=TS   events, newest first, with their process lists
+    /api/speedtest                   speed test state and last result (POST with header X-Mac-Monitor: 1 starts one)
     /api/processes?at=TS             process lists recorded nearest that unix time
     /api/processes?at=TS&window=240  the busiest sample within that many seconds after TS
 
@@ -71,6 +96,7 @@ Downsampled CPU carries both the average and the peak (`cpu_peak`) of each bucke
 | Memory | `vm_stat`; pressure from `kern.memorystatus_vm_pressure_level`; swap from `vm.swapusage` |
 | Disk IO | IOKit `IOBlockStorageDriver` statistics (what `ioreg` prints), via ctypes |
 | Network | `netstat -ibn` |
+| Internet | `/sbin/ping`, `route -n get default`, a UDP DNS query to the servers in `/etc/resolv.conf`, CoreWLAN via ctypes |
 | Volumes | `df -k` (`/` and anything under `/Volumes`) |
 | Thermal | `pmset -g therm` |
 

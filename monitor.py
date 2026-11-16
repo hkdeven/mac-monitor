@@ -40,6 +40,27 @@ DISK_FREE_MIN_PCT = 10.0       # a volume with less free space than this
 CPU_SPEED_LIMIT_MIN = 100      # pmset CPU_Speed_Limit below this means throttling
 EVENT_CLEAR_S = 60             # condition must stay clear this long before an event closes
 
+# Internet checks
+NET_PROBE_INTERVAL_S = 10      # ping the router and both public targets, and query DNS, this often
+NET_TARGETS = [("Cloudflare", "1.1.1.1"), ("Google", "8.8.8.8")]   # two independent public IPs
+NET_PING_COUNT = 4             # pings per target per round
+NET_DNS_NAME = "www.apple.com"                                     # name looked up each round
+NET_HTTP_URL = "https://captive.apple.com/hotspot-detect.html"     # Apple's connectivity check page
+NET_HTTP_INTERVAL_S = 60       # end-to-end HTTPS check this often
+NET_HTTP_TIMEOUT_S = 8
+NET_DOWN_SUSTAIN_S = 20        # both public targets unreachable this long: "Internet down" event
+NET_WINDOW_S = 60              # loss, latency, jitter and DNS are judged over this window
+NET_LOSS_PCT = 10.0            # packet loss over the window that opens an event...
+NET_LOSS_CLEAR_PCT = 3.0       # ...and the level it must fall back under
+NET_LATENCY_MS = 150.0         # median latency to the better public target
+NET_LATENCY_CLEAR_MS = 100.0
+NET_JITTER_MS = 50.0           # median ping stddev
+NET_JITTER_CLEAR_MS = 30.0
+NET_DNS_SLOW_MS = 500.0        # median lookup time while pings are fine
+NET_DNS_SLOW_CLEAR_MS = 300.0
+NET_DNS_FAIL_PCT = 50          # share of lookups failing over the window while pings are fine
+NET_CLEAR_S = 30               # a network event closes after this long back to normal
+
 SAMPLE_INTERVAL_S = 5          # fast metrics: cpu, memory, processes, disk io, network
 SLOW_INTERVAL_S = 30           # slow metrics: df, pmset -g therm
 RETENTION_DAYS = 7
@@ -548,6 +569,397 @@ def top_dicts(by_cpu, by_mem, by_name):
 
 
 # ----------------------------------------------------------------------------
+# Internet probing: router, two public IPs, DNS, one HTTPS check, link info.
+# Runs in its own thread so a dead line (every probe timing out) never delays
+# the 5 s sampler; the sampler only collects finished results.
+# ----------------------------------------------------------------------------
+_PING_STATS = re.compile(r"(\d+) packets transmitted, (\d+) packets received")
+_PING_RTT = re.compile(r"min/avg/max/stddev = ([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+) ms")
+
+
+def parse_ping(out, count):
+    """Summary of `ping -q`. No statistics line at all (no route, bad address,
+    killed) counts as every packet lost."""
+    res = {"sent": count, "recv": 0, "loss": 100.0, "min": None, "avg": None, "max": None, "sd": None}
+    m = _PING_STATS.search(out or "")
+    if m and int(m.group(1)) > 0:
+        res["sent"], res["recv"] = int(m.group(1)), int(m.group(2))
+        res["loss"] = round(100.0 * (res["sent"] - res["recv"]) / res["sent"], 1)
+    m = _PING_RTT.search(out or "")
+    if m and res["recv"]:
+        res["min"], res["avg"], res["max"], res["sd"] = (float(x) for x in m.groups())
+    return res
+
+
+def default_route():
+    """(gateway ip, interface) of the default route, or (None, None)."""
+    out = run_cmd(["route", "-n", "get", "default"], timeout=3)
+    gw = re.search(r"^\s*gateway:\s*(\S+)", out, re.M)
+    ifc = re.search(r"^\s*interface:\s*(\S+)", out, re.M)
+    return (gw.group(1) if gw else None, ifc.group(1) if ifc else None)
+
+
+def dns_servers():
+    """Resolvers macOS is using now (it keeps /etc/resolv.conf current)."""
+    try:
+        with open("/etc/resolv.conf") as f:
+            return [l.split()[1] for l in f if l.startswith("nameserver") and len(l.split()) > 1]
+    except OSError:
+        return []
+
+
+def dns_probe(name, timeout=2.0):
+    """Ask the configured resolvers for `name` directly over UDP, so the answer
+    is never served from this Mac's cache. Tries each server in turn.
+    Returns {"ok", "ms", "server", "error"}."""
+    servers = dns_servers()[:2]
+    if not servers:
+        return {"ok": False, "ms": None, "server": None, "error": "no resolver configured"}
+    qid = int.from_bytes(os.urandom(2), "big")
+    try:
+        qname = b"".join(bytes([len(p)]) + p.encode("ascii") for p in name.strip(".").split(".")) + b"\0"
+    except (UnicodeError, ValueError):
+        return {"ok": False, "ms": None, "server": None, "error": "bad name"}
+    packet = qid.to_bytes(2, "big") + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + qname + b"\x00\x01\x00\x01"
+    err = "timeout"
+    for server in servers:
+        fam = socket.AF_INET6 if ":" in server else socket.AF_INET
+        t0 = time.monotonic()
+        try:
+            with socket.socket(fam, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(timeout)
+                sock.sendto(packet, (server, 53))
+                while True:
+                    data, _ = sock.recvfrom(1500)
+                    if len(data) >= 12 and data[:2] == packet[:2]:
+                        break
+            ms = round((time.monotonic() - t0) * 1000, 1)
+            rcode, answers = data[3] & 0x0F, int.from_bytes(data[6:8], "big")
+            if rcode == 0 and answers > 0:
+                return {"ok": True, "ms": ms, "server": server, "error": None}
+            return {"ok": False, "ms": ms, "server": server,
+                    "error": "NXDOMAIN" if rcode == 3 else "rcode %d" % rcode if rcode else "empty answer"}
+        except socket.timeout:
+            err = "timeout"
+        except OSError as e:
+            err = e.strerror or "network error"
+    return {"ok": False, "ms": None, "server": servers[0], "error": err}
+
+
+class WifiInfo:
+    """Signal, noise and tx rate from CoreWLAN through the Objective-C runtime.
+    No sudo and no location permission needed for these (the network name does
+    need it, so it is not read)."""
+
+    def __init__(self):
+        ctypes.CDLL("/System/Library/Frameworks/CoreWLAN.framework/CoreWLAN")
+        self.objc = ctypes.CDLL("/usr/lib/libobjc.A.dylib")
+        self.objc.objc_getClass.restype = ctypes.c_void_p
+        self.objc.objc_getClass.argtypes = [ctypes.c_char_p]
+        self.objc.sel_registerName.restype = ctypes.c_void_p
+        self.objc.sel_registerName.argtypes = [ctypes.c_char_p]
+        self.objc.objc_autoreleasePoolPush.restype = ctypes.c_void_p
+        self.objc.objc_autoreleasePoolPop.argtypes = [ctypes.c_void_p]
+
+    def _msg(self, obj, sel, restype=ctypes.c_void_p):
+        fn = ctypes.cast(self.objc.objc_msgSend,
+                         ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p))
+        return fn(obj, self.objc.sel_registerName(sel))
+
+    def read(self):
+        """{"iface", "rssi", "noise", "tx_rate", "channel", "band"} or None when Wi-Fi is off."""
+        pool = self.objc.objc_autoreleasePoolPush()
+        try:
+            client = self._msg(self.objc.objc_getClass(b"CWWiFiClient"), b"sharedWiFiClient")
+            ifc = self._msg(client, b"interface") if client else None
+            if not ifc or not self._msg(ifc, b"powerOn", ctypes.c_bool):
+                return None
+            name = self._msg(ifc, b"interfaceName")
+            name = ctypes.string_at(self._msg(name, b"UTF8String")).decode() if name else None
+            rssi = self._msg(ifc, b"rssiValue", ctypes.c_long)
+            chan = self._msg(ifc, b"wlanChannel")
+            return {"iface": name, "rssi": rssi or None,
+                    "noise": self._msg(ifc, b"noiseMeasurement", ctypes.c_long) or None,
+                    "tx_rate": self._msg(ifc, b"transmitRate", ctypes.c_double) or None,
+                    "channel": self._msg(chan, b"channelNumber", ctypes.c_long) if chan else None,
+                    "band": {1: "2.4 GHz", 2: "5 GHz", 3: "6 GHz"}.get(
+                        self._msg(chan, b"channelBand", ctypes.c_long)) if chan else None}
+        finally:
+            self.objc.objc_autoreleasePoolPop(pool)
+
+
+def median(vals):
+    vals = sorted(v for v in vals if v is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2.0
+
+
+SPEEDTEST_RUNNING = threading.Event()   # probes pause while a speed test saturates the line
+
+
+class NetProbe(threading.Thread):
+    def __init__(self):
+        super().__init__(daemon=True, name="netprobe")
+        self.lock = threading.Lock()
+        self.pending = deque()        # finished cycles the sampler has not stored yet
+        self.latest = None
+        self.recent = deque()         # last NET_WINDOW_S of cycles, for the window figures
+        self.http = None              # last finished HTTPS check
+        self.http_reported = 0
+        self.http_started = 0
+        self.http_busy = False
+        self.ports = {}
+        try:
+            self.wifi = WifiInfo()
+            self.wifi.read()
+        except Exception:
+            self.wifi = None
+
+    # -- test hook: MAC_MONITOR_NET_OVERRIDE names a JSON file re-read every cycle,
+    #    {"targets": ["192.0.2.1", "192.0.2.2"], "gateway": "192.0.2.3", "dns_name": "x.invalid"}
+    @staticmethod
+    def overrides():
+        path = os.environ.get("MAC_MONITOR_NET_OVERRIDE")
+        if not path:
+            return {}
+        try:
+            with open(path) as f:
+                o = json.load(f)
+            return o if isinstance(o, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def link_info(self, iface):
+        info = {"iface": iface, "type": None, "rssi": None, "noise": None, "tx_rate": None,
+                "channel": None, "band": None}
+        if not iface:
+            return info
+        wifi = None
+        try:
+            wifi = self.wifi.read() if self.wifi else None
+        except Exception:
+            wifi = None
+        if wifi and wifi["iface"] == iface:
+            info.update(wifi, type="Wi-Fi")
+            return info
+        if iface not in self.ports:
+            out = run_cmd(["networksetup", "-listallhardwareports"], timeout=5)
+            for port, dev in re.findall(r"Hardware Port: (.+)\nDevice: (\S+)", out):
+                self.ports[dev] = port
+            self.ports.setdefault(iface, "VPN or tunnel" if iface.startswith(("utun", "ipsec", "ppp")) else "Other")
+        info["type"] = self.ports[iface]
+        return info
+
+    def _http_check(self):
+        t0 = time.monotonic()
+        res = {"ok": False, "ms": None, "error": None, "url": NET_HTTP_URL}
+        try:
+            import urllib.request
+            req = urllib.request.Request(NET_HTTP_URL, headers={"User-Agent": "Mozilla/5.0 (connectivity check)"})
+            with urllib.request.urlopen(req, timeout=NET_HTTP_TIMEOUT_S) as r:
+                r.read(512)
+                res["ok"] = r.status in (200, 204)
+                res["error"] = None if res["ok"] else "HTTP %d" % r.status
+            res["ms"] = round((time.monotonic() - t0) * 1000, 1)
+        except Exception as e:
+            res["error"] = (str(getattr(e, "reason", e)) or e.__class__.__name__)[:80]
+        res["ts"] = int(time.time())
+        with self.lock:
+            self.http = res
+            self.http_busy = False
+
+    def cycle(self, wait_http=False):
+        """One round of probes. Bounded: pings give up after 3 s, DNS after 2 s per server."""
+        ov = self.overrides()
+        now = time.time()
+        gw, iface = default_route()
+        if ov.get("gateway"):
+            gw = ov["gateway"]
+        targets = list(NET_TARGETS)
+        for i, ip in enumerate(ov.get("targets") or []):
+            if i < len(targets):
+                targets[i] = (targets[i][0], str(ip))
+        procs = []
+        for label, ip in [("Router", gw)] + targets:
+            p = None
+            if ip:
+                try:
+                    p = subprocess.Popen(
+                        ["/sbin/ping", "-n", "-q", "-c", str(NET_PING_COUNT), "-i", "0.25",
+                         "-W", "1000", "-t", "3", ip],
+                        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                except OSError:
+                    p = None
+            procs.append((label, ip, p))
+        if not self.http_busy and now - self.http_started >= NET_HTTP_INTERVAL_S:
+            self.http_busy, self.http_started = True, now
+            th = threading.Thread(target=self._http_check, daemon=True, name="httpcheck")
+            th.start()
+            if wait_http:
+                th.join(NET_HTTP_TIMEOUT_S + 2)
+        dns = dns_probe(ov.get("dns_name") or NET_DNS_NAME)
+        dns["name"] = ov.get("dns_name") or NET_DNS_NAME
+        pings = []
+        for label, ip, p in procs:
+            out = ""
+            if p:
+                try:
+                    out = p.communicate(timeout=6)[0].decode("utf-8", "replace")
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    p.communicate()
+            r = parse_ping(out, NET_PING_COUNT)
+            r.update(name=label, ip=ip)
+            pings.append(r)
+        gwr, pub = pings[0], pings[1:]
+        up = [t for t in pub if t["recv"] > 0]
+        if up:
+            state = "up"
+            best = min(up, key=lambda t: t["avg"])
+            lat, jit, loss = best["avg"], best["sd"], min(t["loss"] for t in pub)
+        else:
+            state = "down_isp" if gwr["recv"] > 0 else "down_local"
+            lat = jit = None
+            loss = 100.0
+        res = {"ts": int(round(now)), "state": state, "gateway": gwr, "targets": pub,
+               "latency_ms": lat, "jitter_ms": jit, "loss": loss, "dns": dns,
+               "link": self.link_info(iface), "http_new": None}
+        with self.lock:
+            if self.http and self.http["ts"] != self.http_reported:
+                res["http_new"] = self.http
+                self.http_reported = self.http["ts"]
+            res["http"] = self.http
+            self.recent.append(res)
+            while self.recent and self.recent[0]["ts"] < res["ts"] - NET_WINDOW_S:
+                self.recent.popleft()
+            ok = [r for r in self.recent if r["state"] == "up"]
+            res["window"] = {
+                "cycles": len(ok),
+                "full": len(ok) >= max(3, NET_WINDOW_S // NET_PROBE_INTERVAL_S - 2),
+                "loss": round(sum(r["loss"] for r in ok) / len(ok), 1) if ok else None,
+                "latency_ms": median([r["latency_ms"] for r in ok]),
+                "jitter_ms": median([r["jitter_ms"] for r in ok]),
+                "dns_ms": median([r["dns"]["ms"] for r in ok if r["dns"]["ok"]]),
+                "dns_fail_pct": round(100.0 * sum(1 for r in ok if not r["dns"]["ok"]) / len(ok)) if ok else None,
+            }
+            res["verdict"] = net_verdict(res)
+            self.latest = res
+        return res
+
+    def drain(self):
+        with self.lock:
+            out = list(self.pending)
+            self.pending.clear()
+        return out
+
+    def run(self):
+        next_at = time.monotonic()
+        while True:
+            delay = next_at - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            next_at = max(next_at + NET_PROBE_INTERVAL_S, time.monotonic() + 2)
+            if SPEEDTEST_RUNNING.is_set():
+                continue      # its own traffic would read as loss and latency; leave a gap instead
+            try:
+                res = self.cycle()
+                if SPEEDTEST_RUNNING.is_set():
+                    continue
+                with self.lock:
+                    self.pending.append(res)
+            except Exception as e:
+                sys.stderr.write("netprobe error: %r\n" % (e,))
+
+
+def net_problems(res):
+    """Which degraded conditions hold on the window figures (not counting 'down').
+    Returns {"loss": bool, "latency": bool, "jitter": bool, "dns_fail": bool, "dns_slow": bool}."""
+    w = res["window"]
+    full = w["full"] and res["state"] == "up"
+    return {
+        "loss": bool(full and w["loss"] is not None and w["loss"] >= NET_LOSS_PCT),
+        "latency": bool(full and w["latency_ms"] is not None and w["latency_ms"] > NET_LATENCY_MS),
+        "jitter": bool(full and w["jitter_ms"] is not None and w["jitter_ms"] > NET_JITTER_MS),
+        "dns_fail": bool(full and w["dns_fail_pct"] is not None and w["dns_fail_pct"] >= NET_DNS_FAIL_PCT),
+        "dns_slow": bool(full and w["dns_ms"] is not None and w["dns_ms"] > NET_DNS_SLOW_MS),
+    }
+
+
+def net_where(res):
+    if res["state"] == "down_local":
+        if not res["gateway"]["ip"]:
+            return "no network connection on this Mac"
+        return "router unreachable (Wi-Fi or local network)"
+    return "router reachable, ISP side"
+
+
+def net_verdict(res):
+    """{"level": good|warning|critical, "text": plain verdict} for the tile and snapshot."""
+    if res["state"] != "up":
+        return {"level": "critical", "text": "Down - " + net_where(res)}
+    w, p = res["window"], net_problems(res)
+    lat = res["latency_ms"]
+    if p["loss"]:
+        return {"level": "warning", "text": "Dropping packets, %.0f%% loss" % w["loss"]}
+    if p["latency"]:
+        return {"level": "warning", "text": "Slow, %.0f ms" % w["latency_ms"]}
+    if p["jitter"]:
+        return {"level": "warning", "text": "Unsteady, jitter %.0f ms" % w["jitter_ms"]}
+    if p["dns_fail"]:
+        return {"level": "warning", "text": "DNS failing"}
+    if p["dns_slow"]:
+        return {"level": "warning", "text": "DNS slow, %.0f ms" % w["dns_ms"]}
+    loss = w["loss"] if w["loss"] is not None else res["loss"]
+    return {"level": "good", "text": "Good, %.0f ms, %.0f%% loss" % (lat, loss)}
+
+
+def store_net(con, r):
+    g, (a, b) = r["gateway"], r["targets"]
+    h, d, l = r["http_new"], r["dns"], r["link"]
+    con.execute(
+        "INSERT OR REPLACE INTO net VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (r["ts"], r["state"], l["iface"], g["ip"], g["avg"], g["max"], g["loss"],
+         a["avg"], a["max"], a["sd"], a["loss"], b["avg"], b["max"], b["sd"], b["loss"],
+         r["latency_ms"], r["loss"], d["ms"] if d["ok"] else None, 1 if d["ok"] else 0,
+         h["ms"] if h and h["ok"] else None, None if h is None else (1 if h["ok"] else 0),
+         l["rssi"], l["noise"], l["tx_rate"]))
+
+
+def net_summary(con, start, end):
+    """Uptime, outages and latency over a window, from the raw probe rows."""
+    rows = con.execute("SELECT ts, state, lat_ms, loss FROM net WHERE ts > ? AND ts <= ? ORDER BY ts",
+                       (start, end)).fetchall()
+    if not rows:
+        return None
+    gap = NET_PROBE_INTERVAL_S * 3
+    outages, run_start, prev_ts, down_rows = [], None, None, 0
+    for r in rows:
+        down = r["state"] != "up"
+        if run_start is not None and (not down or r["ts"] - prev_ts > gap):
+            outages.append((run_start, prev_ts + NET_PROBE_INTERVAL_S))
+            run_start = None
+        if down:
+            down_rows += 1
+            if run_start is None:
+                run_start = r["ts"]
+        prev_ts = r["ts"]
+    if run_start is not None:
+        outages.append((run_start, prev_ts + NET_PROBE_INTERVAL_S))
+    lats = [r["lat_ms"] for r in rows if r["lat_ms"] is not None]
+    up_loss = [r["loss"] for r in rows if r["state"] == "up"]
+    med = median(lats)
+    return {"probes": len(rows), "uptime_pct": round(100.0 * (len(rows) - down_rows) / len(rows), 2),
+            "outages": len(outages), "outage_s": sum(e - s for s, e in outages),
+            "longest_outage_s": max([e - s for s, e in outages] or [0]),
+            "last_outage": outages[-1][0] if outages else None,
+            "latency_median_ms": round(med, 1) if med is not None else None,
+            "latency_worst_ms": round(max(lats), 1) if lats else None,
+            "loss_pct": round(sum(up_loss) / len(up_loss), 2) if up_loss else None}
+
+
+# ----------------------------------------------------------------------------
 # Storage
 # ----------------------------------------------------------------------------
 SCHEMA = """
@@ -577,6 +989,17 @@ CREATE TABLE IF NOT EXISTS events (
   by_cpu TEXT, by_mem TEXT, by_name TEXT
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);   -- small persistent settings
+CREATE TABLE IF NOT EXISTS net (
+  ts INTEGER PRIMARY KEY, state TEXT,          -- up | down_isp | down_local
+  iface TEXT, gw TEXT, gw_ms REAL, gw_max REAL, gw_loss REAL,
+  a_ms REAL, a_max REAL, a_sd REAL, a_loss REAL,   -- first public target
+  b_ms REAL, b_max REAL, b_sd REAL, b_loss REAL,   -- second public target
+  lat_ms REAL, loss REAL,                      -- the better target's latency, the lower loss
+  dns_ms REAL, dns_ok INTEGER,
+  http_ms REAL, http_ok INTEGER,               -- NULL on rounds without an HTTPS check
+  rssi INTEGER, noise INTEGER, tx_rate REAL
+);
 """
 
 
@@ -591,6 +1014,28 @@ def open_db(readonly=False):
         con.executescript(SCHEMA)
     con.row_factory = sqlite3.Row
     return con
+
+
+def meta_get(key, default=None):
+    """A persisted setting (JSON), readable from any thread."""
+    try:
+        con = open_db(readonly=True)
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        finally:
+            con.close()
+        return json.loads(row[0]) if row else default
+    except (sqlite3.Error, ValueError):
+        return default
+
+
+def meta_set(key, value):
+    con = open_db()
+    try:
+        con.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (key, json.dumps(value)))
+        con.commit()
+    finally:
+        con.close()
 
 
 def store_sample(con, s):
@@ -704,6 +1149,69 @@ class EventEngine:
                 ("Load above %g (%gx %d cores) for %ds" % (crit, LOAD_CRITICAL_X_NCPU, n, LOAD_SUSTAIN_S),
                  act["id"]))
 
+    def track(self, key, now, opens, stays, sustain, clear_s, kind, sev, title, value, unit, higher, top):
+        """One hysteresis rule. Opens after `opens` has held for `sustain` seconds,
+        stays open while `stays` holds, closes once `stays` has been false for
+        `clear_s`. Severity and title follow the condition while it is open."""
+        j = lambda o: json.dumps(o, separators=(",", ":"))
+        act = self.active.get(key)
+        if act:
+            if stays:
+                act["clear_since"] = None
+                if (value > act["peak"]) if higher else (value < act["peak"]):
+                    act["peak"] = value
+                    self.con.execute("UPDATE events SET peak=? WHERE id=?", (value, act["id"]))
+                if opens and (title != act["title"] or sev != act["sev"]):
+                    act["title"], act["sev"] = title, sev
+                    self.con.execute("UPDATE events SET title=?, severity=? WHERE id=?", (title, sev, act["id"]))
+            else:
+                if act["clear_since"] is None:
+                    act["clear_since"] = now
+                if now - act["clear_since"] >= clear_s:
+                    self.con.execute("UPDATE events SET end_ts=? WHERE id=?", (act["clear_since"], act["id"]))
+                    del self.active[key]
+            return
+        if not opens:
+            self.pending.pop(key, None)
+            return
+        since = self.pending.setdefault(key, now)
+        if now - since < sustain:
+            return
+        self.pending.pop(key, None)
+        cur = self.con.execute(
+            "INSERT INTO events (ts,end_ts,kind,severity,title,value,peak,unit,by_cpu,by_mem,by_name) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (now, None, kind, sev, title, value, value, unit,
+             j(top["cpu"]), j(top["mem"]), j(top["groups"])))
+        self.active[key] = {"id": cur.lastrowid, "peak": value, "clear_since": None, "title": title, "sev": sev}
+
+    def feed_net(self, r, top):
+        """Network rules, fed once per finished probe round."""
+        now, w, p = r["ts"], r["window"], net_problems(r)
+        down = r["state"] != "up"
+        self.track("net_down", now, down, down, NET_DOWN_SUSTAIN_S, NET_CLEAR_S, "net_down", "critical",
+                   "Internet down - " + net_where(r), 100.0, "% loss", True, top)
+        up = not down and w["full"]
+        loss = w["loss"] or 0.0
+        self.track("net_loss", now, p["loss"], up and loss >= NET_LOSS_CLEAR_PCT, 0, NET_CLEAR_S,
+                   "net_loss", "warning", "Packet loss above %g%%" % NET_LOSS_PCT, loss, "% loss", True, top)
+        lat, jit = w["latency_ms"] or 0.0, w["jitter_ms"] or 0.0
+        slow = p["latency"] or p["jitter"]
+        still = up and (lat > NET_LATENCY_CLEAR_MS or jit > NET_JITTER_CLEAR_MS)
+        if p["latency"] or not p["jitter"]:
+            title, value, unit = "High latency, above %g ms" % NET_LATENCY_MS, lat, "ms"
+        else:
+            title, value, unit = "Unsteady connection, jitter above %g ms" % NET_JITTER_MS, jit, "ms jitter"
+        self.track("net_slow", now, slow, still, 0, NET_CLEAR_S, "net_slow", "warning", title, value, unit, True, top)
+        fail, dms = w["dns_fail_pct"] or 0, w["dns_ms"] or 0.0
+        dns_bad = p["dns_fail"] or p["dns_slow"]
+        dns_still = up and (fail >= NET_DNS_FAIL_PCT / 2.0 or dms > NET_DNS_SLOW_CLEAR_MS)
+        if p["dns_fail"] or not p["dns_slow"]:
+            title, value, unit = "DNS failing while the connection is up", float(fail), "% failed"
+        else:
+            title, value, unit = "DNS slow, above %g ms" % NET_DNS_SLOW_MS, dms, "ms"
+        self.track("net_dns", now, dns_bad, dns_still, 0, NET_CLEAR_S, "net_dns", "warning", title, value, unit, True, top)
+
     def feed(self, s):
         now = s["ts"]
         j = lambda o: json.dumps(o, separators=(",", ":"))
@@ -753,18 +1261,17 @@ class Sampler(threading.Thread):
         self.cost = deque(maxlen=120)   # (cpu seconds spent, wall seconds covered) per sample
         self.samples_taken = 0
         self.started = time.time()
+        self.net = NetProbe()
 
     @staticmethod
     def _cpu_spent():
         ch = resource.getrusage(resource.RUSAGE_CHILDREN)
-        try:
-            own = time.thread_time()
-        except Exception:
-            own = 0.0
-        return own + ch.ru_utime + ch.ru_stime
+        me = resource.getrusage(resource.RUSAGE_SELF)
+        return me.ru_utime + me.ru_stime + ch.ru_utime + ch.ru_stime
 
     def overhead_pct(self):
-        """Sampler CPU (this thread + the commands it runs) as % of one core."""
+        """CPU of the whole monitor (sampler, network probes, the commands they
+        run, and serving the dashboard) as % of one core."""
         with self.lock:
             cost = list(self.cost)
         wall = sum(c[1] for c in cost)
@@ -774,32 +1281,38 @@ class Sampler(threading.Thread):
         con = open_db()
         engine = EventEngine(con)
         self.collector.sample()           # prime the counters
+        self.net.start()
         next_at = time.monotonic() + 1
         last_prune = 0
         last_wall = time.monotonic()
+        last_cpu = self._cpu_spent()
         while True:
             delay = next_at - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
             next_at = max(next_at + SAMPLE_INTERVAL_S, time.monotonic() + 1)
-            c0 = self._cpu_spent()
             try:
                 s = self.collector.sample()
                 store_sample(con, s)
                 engine.feed(s)
+                for r in self.net.drain():
+                    store_net(con, r)
+                    engine.feed_net(r, s["top"])
                 if time.time() - last_prune > 3600:
                     cutoff = int(time.time()) - RETENTION_DAYS * 86400
                     con.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
                     con.execute("DELETE FROM procs WHERE ts < ?", (cutoff,))
                     con.execute("DELETE FROM events WHERE ts < ?", (cutoff,))
+                    con.execute("DELETE FROM net WHERE ts < ?", (cutoff,))
                     last_prune = time.time()
                 con.commit()
                 self.samples_taken += 1
                 wall = time.monotonic()
                 with self.lock:
                     self.latest = s
-                    self.cost.append((self._cpu_spent() - c0, wall - last_wall))
-                last_wall = wall
+                    cpu = self._cpu_spent()
+                    self.cost.append((cpu - last_cpu, wall - last_wall))
+                last_wall, last_cpu = wall, cpu
             except Exception as e:  # never let one bad sample stop the sampler
                 sys.stderr.write("sampler error: %r\n" % (e,))
                 try:
@@ -830,11 +1343,28 @@ def query_history(con, rng, end=None):
         for i, n in enumerate(names):
             v = r[i]
             cols[n].append(round(v, 2) if isinstance(v, float) else v)
+    # internet probes, laid onto the same buckets (None where a bucket has no probe)
+    nb = max(bucket, NET_PROBE_INTERVAL_S)
+    net = {}
+    for r in con.execute(
+            "SELECT (ts/?)*? AS t, AVG(gw_ms), AVG(a_ms), AVG(b_ms), AVG(loss), MAX(state != 'up'),"
+            " AVG(dns_ms), MAX(MAX(COALESCE(a_max, 0), COALESCE(b_max, 0))), AVG(gw_loss)"
+            " FROM net WHERE ts > ? AND ts <= ? GROUP BY ts/?", (nb, nb, start, end, nb)):
+        net[r[0]] = r
+    nnames = ["net_gw", "net_a", "net_b", "net_loss", "net_down", "dns_ms", "net_worst", "net_gw_loss"]
+    for n in nnames:
+        cols[n] = []
+    for t in cols["t"]:
+        r = net.get(t) if t % nb == 0 else None
+        for i, n in enumerate(nnames):
+            v = r[i + 1] if r is not None else None
+            cols[n].append(round(v, 1) if isinstance(v, float) else v)
     evs = con.execute(
         "SELECT * FROM events WHERE ts <= ? AND COALESCE(end_ts, ?) >= ? ORDER BY ts",
         (end, now, start)).fetchall()
     return {"range": rng, "start": start, "end": end, "bucket": bucket, "live": end >= now - 2,
-            "points": len(rows), "series": cols,
+            "points": len(rows), "series": cols, "net_summary": net_summary(con, start, end),
+            "net_targets": [{"name": n, "ip": ip} for n, ip in NET_TARGETS],
             "events": [event_dict(e, with_procs=False) for e in evs]}
 
 
@@ -876,10 +1406,64 @@ def query_events(con, limit=100, since=None):
 
 
 # ----------------------------------------------------------------------------
+# On-demand speed test (networkQuality ships with macOS). Never runs by itself:
+# it moves a couple of hundred MB and disturbs the line while it runs.
+# ----------------------------------------------------------------------------
+class SpeedTest:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.running_since = None
+        self.last = meta_get("speedtest")
+
+    def status(self):
+        with self.lock:
+            return {"available": os.path.exists("/usr/bin/networkQuality"),
+                    "running": self.running_since is not None, "started": self.running_since,
+                    "expected_s": 20, "last": self.last}
+
+    def start(self):
+        with self.lock:
+            if self.running_since is None:
+                self.running_since = int(time.time())
+                threading.Thread(target=self._run, daemon=True, name="speedtest").start()
+        return self.status()
+
+    def _run(self):
+        res = {"ts": int(time.time()), "ok": False, "error": None}
+        SPEEDTEST_RUNNING.set()
+        try:
+            out = subprocess.run(["/usr/bin/networkQuality", "-c"], stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, timeout=90)
+            d = json.loads(out.stdout.decode("utf-8", "replace") or "{}")
+            if d.get("dl_throughput"):
+                res.update(ok=True, down_mbps=round(d["dl_throughput"] / 1e6, 1),
+                           up_mbps=round(d.get("ul_throughput", 0) / 1e6, 1),
+                           rtt_ms=round(d["base_rtt"], 1) if d.get("base_rtt") else None,
+                           responsiveness_rpm=round(d["responsiveness"]) if d.get("responsiveness") else None,
+                           iface=d.get("interface_name"),
+                           megabytes=round((d.get("dl_bytes_transferred", 0) + d.get("ul_bytes_transferred", 0)) / 1e6))
+            else:
+                res["error"] = (out.stderr.decode("utf-8", "replace").strip() or "no result")[:160]
+        except subprocess.TimeoutExpired:
+            res["error"] = "timed out after 90 s"
+        except Exception as e:
+            res["error"] = str(e)[:160]
+        SPEEDTEST_RUNNING.clear()
+        res["took_s"] = int(time.time()) - res["ts"]
+        try:
+            meta_set("speedtest", res)
+        except sqlite3.Error:
+            pass
+        with self.lock:
+            self.last, self.running_since = res, None
+
+
+# ----------------------------------------------------------------------------
 # HTTP
 # ----------------------------------------------------------------------------
 class Handler(BaseHTTPRequestHandler):
     sampler = None
+    speedtest = None
     server_version = "mac-monitor"
 
     def log_message(self, *a):
@@ -895,6 +1479,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def _json(self, obj, code=200):
         self._send(code, json.dumps(obj, separators=(",", ":")).encode(), "application/json")
+
+    def do_POST(self):
+        # state-changing calls must come from the dashboard's own script: a custom
+        # header cannot be sent cross-site without a preflight this server never grants
+        u = urlparse(self.path)
+        try:
+            self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536))
+            if self.headers.get("X-Mac-Monitor") != "1":
+                return self._json({"error": "missing X-Mac-Monitor header"}, 403)
+            if u.path == "/api/speedtest":
+                return self._json(self.speedtest.start())
+            return self._json({"error": "not found"}, 404)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception as e:
+            self._json({"error": repr(e)}, 500)
 
     def do_GET(self):
         u = urlparse(self.path)
@@ -920,6 +1520,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"events": query_events(con, q.get("limit", 100), q.get("since"))})
                 finally:
                     con.close()
+            if u.path == "/api/speedtest":
+                return self._json(self.speedtest.status())
             if u.path == "/api/processes":
                 con = open_db(readonly=True)
                 try:
@@ -951,6 +1553,9 @@ class Handler(BaseHTTPRequestHandler):
             out["active_events"] = [event_dict(r, with_procs=False) for r in rows]
         finally:
             con.close()
+        with sm.net.lock:
+            net = sm.net.latest
+        out["internet"] = net and {k: v for k, v in net.items() if k != "http_new"}
         n = sm.collector.ncpu
         out["limits"] = {"load_warn": n * LOAD_WARN_X_NCPU, "load_critical": n * LOAD_CRITICAL_X_NCPU,
                          "load_clear": n * LOAD_CLEAR_X_NCPU, "load_sustain_s": LOAD_SUSTAIN_S}
@@ -984,6 +1589,7 @@ def serve():
     httpd.daemon_threads = True
     sampler = Sampler()
     Handler.sampler = sampler
+    Handler.speedtest = SpeedTest()
     sampler.start()
     print("mac-monitor: http://127.0.0.1:%d/   (data: %s)" % (port, DB_PATH), flush=True)
     try:
@@ -1055,6 +1661,25 @@ def snapshot():
         fmt_bytes(s["net"]["in_bps"], True), fmt_bytes(s["net"]["out_bps"], True),
         ", ".join(k for k, v in s["net"]["ifaces"].items()
                   if not k.startswith("lo") and (v["in_bps"] or v["out_bps"])) or "idle"))
+    probe = NetProbe()
+    net = probe.cycle(wait_http=True)
+    g, d, l, h = net["gateway"], net["dns"], net["link"], probe.http
+    ms = lambda v: "no reply" if v is None else "%.1f ms" % v
+    P("  Internet  %s" % net["verdict"]["text"])
+    P("    router  %-15s %s, %.0f%% loss" % (g["ip"] or "none", ms(g["avg"]), g["loss"]))
+    for t in net["targets"]:
+        P("    %-7s %-15s %s (max %s, jitter %s), %.0f%% loss" % (
+            t["name"][:7], t["ip"], ms(t["avg"]), ms(t["max"]), ms(t["sd"]), t["loss"]))
+    P("    DNS     %s via %s: %s" % (d["name"], d["server"] or "no resolver",
+                                    ms(d["ms"]) if d["ok"] else "FAILED (%s)" % d["error"]))
+    P("    resolvers  " + (", ".join(dns_servers()) or "none configured"))
+    if h:
+        P("    HTTPS   %s: %s" % (h["url"], ms(h["ms"]) if h["ok"] else "FAILED (%s)" % h["error"]))
+    if l["type"] == "Wi-Fi":
+        P("    link    Wi-Fi %s, signal %s dBm, noise %s dBm, tx rate %s Mbps, channel %s (%s)" % (
+            l["iface"], l["rssi"], l["noise"], "%.0f" % l["tx_rate"] if l["tx_rate"] else "?", l["channel"], l["band"]))
+    else:
+        P("    link    %s %s" % (l["type"] or "none", l["iface"] or ""))
     th = s["thermal"]
     if th["speed_limit"] is None:
         P("  Thermal   CPU speed limit not reported by pmset on this machine" +
@@ -1103,6 +1728,24 @@ def snapshot():
         P("  Net out peak    " + peak("net_out", lambda v: fmt_bytes(v, True))[0])
         r = con.execute("SELECT MIN(speed_limit) FROM samples WHERE ts > ?", (since,)).fetchone()[0]
         P("  Speed limit min %s" % ("not reported" if r is None else "%d%%" % r))
+    try:
+        ns = net_summary(con, since, int(time.time()))
+    except sqlite3.Error:
+        ns = None
+    P("")
+    P("INTERNET, LAST 24H" + ("  (%d probe rounds)" % ns["probes"] if ns else ""))
+    if not ns:
+        P("  no probes recorded yet")
+    else:
+        P("  Uptime          %.2f%%" % ns["uptime_pct"])
+        P("  Outages         %d, %s in total%s" % (
+            ns["outages"], fmt_dur(ns["outage_s"]),
+            ", longest %s, last at %s" % (fmt_dur(ns["longest_outage_s"]), fmt_ts(ns["last_outage"])) if ns["outages"] else ""))
+        P("  Latency         median %s, worst %s" % (ms(ns["latency_median_ms"]), ms(ns["latency_worst_ms"])))
+        P("  Packet loss     %s while up" % ("-" if ns["loss_pct"] is None else "%.2f%%" % ns["loss_pct"]))
+        st = meta_get("speedtest")
+        if st and st.get("ok"):
+            P("  Last speed test %s: %.1f Mbps down, %.1f Mbps up" % (fmt_ts(st["ts"]), st["down_mbps"], st["up_mbps"]))
     P("")
     evs = con.execute("SELECT * FROM events ORDER BY ts DESC LIMIT 15").fetchall()
     P("RECENT EVENTS (%d shown, 7 days kept)" % len(evs))
