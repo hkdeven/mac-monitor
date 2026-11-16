@@ -1,0 +1,604 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mac-monitor</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f3f2ee; --surface: #fcfcfb; --raised: #ffffff;
+  --border: #dedcd5; --grid: #e9e7e1;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #7c7b75;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100;
+  --good: #0ca30c; --warning: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --sel: #e6effb; --sel-border: #2a78d6; --hover: #eeede8;
+  --pill: #0b0b0b; --pill-text: #fcfcfb;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    color-scheme: dark;
+    --page: #111110; --surface: #1a1a19; --raised: #232321;
+    --border: #33332f; --grid: #2a2a27;
+    --text: #f0efec; --text-2: #c3c2b7; --muted: #8f8e85;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500;
+    --sel: #17304f; --sel-border: #3987e5; --hover: #262624;
+    --pill: #f0efec; --pill-text: #1a1a19;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--page); color: var(--text);
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+  -webkit-text-size-adjust: 100%;
+}
+main { max-width: 1320px; margin: 0 auto; padding: 16px; display: grid; gap: 14px; }
+h1 { font-size: 17px; margin: 0; font-weight: 650; }
+h2 { font-size: 13px; margin: 0; font-weight: 600; }
+.num { font-variant-numeric: tabular-nums; }
+button { font: inherit; color: inherit; }
+
+header { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; justify-content: space-between; }
+.hostline { color: var(--text-2); font-size: 12.5px; min-width: 0; overflow-wrap: anywhere; }
+.conn { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); white-space: nowrap; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: none; }
+.conn.stale .dot { background: var(--critical); }
+.conn.tick .dot { animation: pulse .6s ease-out; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 var(--good); } 100% { box-shadow: 0 0 0 7px transparent; } }
+
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; min-width: 0; position: relative; overflow: hidden; }
+
+/* tiles */
+.tiles { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+.tile { padding: 11px 13px 12px; }
+.tile .k { font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 6px; }
+.tile .v { font-size: 22px; font-weight: 620; letter-spacing: -.01em; margin-top: 3px; line-height: 1.2; overflow-wrap: anywhere; }
+.tile .v.two { font-size: 16px; line-height: 1.35; }
+.tile .v.small { font-size: 17px; }
+.tile .sub { font-size: 12px; color: var(--muted); margin-top: 3px; overflow-wrap: anywhere; }
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600; padding: 1px 7px 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--text); white-space: nowrap; }
+.badge i { width: 8px; height: 8px; border-radius: 50%; background: var(--good); font-style: normal; flex: none; }
+.badge.warning i { background: var(--warning); border-radius: 1px; transform: rotate(45deg); width: 7px; height: 7px; }
+.badge.critical i { background: var(--critical); border-radius: 1px; }
+.badge.na i { background: var(--muted); }
+.cores { display: flex; gap: 2px; align-items: flex-end; height: 22px; margin-top: 7px; }
+.cores span { flex: 1; min-width: 2px; background: var(--grid); border-radius: 2px 2px 0 0; height: 100%; position: relative; overflow: hidden; }
+.cores span b { position: absolute; left: 0; right: 0; bottom: 0; background: var(--s1); border-radius: 2px 2px 0 0; transition: height .4s; }
+
+/* toolbar */
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.seg { display: inline-flex; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 2px; gap: 2px; }
+.seg button { border: 0; background: none; padding: 5px 11px; border-radius: 6px; cursor: pointer; font-size: 12.5px; font-weight: 550; color: var(--text-2); min-width: 40px; }
+.seg button:hover { background: var(--hover); }
+.seg button[aria-pressed="true"] { background: var(--pill); color: var(--pill-text); }
+.seg button:focus-visible, .btn:focus-visible, .ev:focus-visible { outline: 2px solid var(--sel-border); outline-offset: 1px; }
+.view { display: inline-flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-2); min-width: 0; flex-wrap: wrap; }
+.btn { border: 1px solid var(--border); background: var(--raised); border-radius: 7px; padding: 4px 10px; cursor: pointer; font-size: 12.5px; font-weight: 550; }
+.btn:hover { background: var(--hover); }
+.btn:active, .seg button:active { transform: translateY(1px); }
+.spin { width: 12px; height: 12px; border: 2px solid var(--border); border-top-color: var(--s1); border-radius: 50%; animation: rot .7s linear infinite; display: none; flex: none; }
+.busy .spin, .spin.on { display: inline-block; }
+@keyframes rot { to { transform: rotate(360deg); } }
+
+/* loading bar shared by cards */
+.card.loading::before {
+  content: ""; position: absolute; top: 0; left: 0; height: 2px; width: 40%; background: var(--s1);
+  animation: slide 1s ease-in-out infinite; z-index: 3;
+}
+@keyframes slide { 0% { left: -40%; } 100% { left: 100%; } }
+.card.loading canvas, .card.loading tbody { opacity: .45; }
+canvas, tbody { transition: opacity .15s; }
+
+/* charts */
+.charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.chart { padding: 11px 12px 8px; }
+.chead { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
+.chead .hint { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 6px; }
+.legend { display: flex; flex-wrap: wrap; gap: 3px 12px; font-size: 12px; color: var(--text-2); }
+.legend span { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.sw.line { height: 3px; border-radius: 2px; width: 12px; }
+.plot { position: relative; height: 190px; }
+.plot canvas { position: absolute; inset: 0; width: 100%; height: 100%; cursor: crosshair; touch-action: pan-y; }
+.chart.pick .plot canvas { cursor: pointer; }
+.tip {
+  position: absolute; top: 6px; pointer-events: none; background: var(--raised); border: 1px solid var(--border);
+  border-radius: 8px; padding: 7px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,.14); z-index: 2;
+  min-width: 150px; max-width: 230px; display: none;
+}
+.tip .tt { color: var(--text-2); margin-bottom: 4px; }
+.tip .row { display: flex; align-items: center; gap: 6px; }
+.tip .row span:nth-child(2) { flex: 1; color: var(--text-2); }
+.tip .row b { font-weight: 600; }
+.empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; color: var(--muted); font-size: 12.5px; text-align: center; padding: 0 20px; pointer-events: none; }
+
+/* bottom panels */
+.panels { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 10px; align-items: start; }
+.panel { padding: 11px 12px 6px; }
+.phead { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; justify-content: space-between; margin-bottom: 8px; }
+.pwhen { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--text-2); flex-wrap: wrap; margin-bottom: 6px; min-height: 26px; }
+table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+th, td { padding: 5px 6px; text-align: right; font-size: 12.5px; border-top: 1px solid var(--grid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+th { font-weight: 550; color: var(--muted); font-size: 11.5px; border-top: 0; }
+th:first-child, td:first-child { text-align: left; width: 46%; padding-left: 2px; }
+th.sorted { color: var(--text); }
+td.bar { position: relative; }
+td.bar i { position: absolute; left: 6px; right: 6px; bottom: 2px; height: 2px; background: var(--grid); border-radius: 1px; }
+td.bar i b { display: block; height: 100%; background: var(--s1); border-radius: 1px; }
+.none { color: var(--muted); font-size: 12.5px; padding: 14px 2px 16px; }
+.evlist { display: grid; gap: 2px; max-height: 420px; overflow-y: auto; margin: 0 -6px; padding: 0 0 6px; }
+.ev { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 2px 9px; text-align: left; border: 0; border-left: 3px solid transparent; background: none; padding: 7px 8px 7px 7px; border-radius: 6px; cursor: pointer; width: 100%; }
+.ev:hover { background: var(--hover); }
+.ev.sel { background: var(--sel); border-left-color: var(--sel-border); }
+.ev .t { font-weight: 550; font-size: 13px; overflow-wrap: anywhere; }
+.ev .m { grid-column: 2; font-size: 12px; color: var(--text-2); }
+.ev .badge { align-self: start; margin-top: 1px; }
+footer { color: var(--muted); font-size: 12px; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0 2px 8px; }
+footer a { color: var(--text-2); }
+
+@media (max-width: 1040px) { .tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 900px) {
+  .charts, .panels { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 520px) {
+  main { padding: 10px; gap: 10px; }
+  .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tile .v { font-size: 19px; }
+  .tile .v.two { font-size: 14.5px; }
+  .tile .v.small { font-size: 15px; }
+  .plot { height: 165px; }
+  .seg button { padding: 6px 9px; min-width: 36px; }
+  th:nth-child(2), td:nth-child(2) { display: none; }
+  th:first-child, td:first-child { width: 52%; }
+}
+@media (prefers-reduced-motion: reduce) { * { animation-duration: 0s !important; transition: none !important; } .card.loading::before { left: 0; width: 100%; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>mac-monitor</h1>
+      <div class="hostline" id="hostline">Connecting…</div>
+    </div>
+    <div class="conn" id="conn"><span class="dot"></span><span id="connText">Waiting for first sample…</span></div>
+  </header>
+
+  <section class="tiles" aria-label="Current state">
+    <div class="card tile"><div class="k">CPU</div><div class="v num" id="tCpu">-</div><div class="sub num" id="tCpuSub">&nbsp;</div><div class="cores" id="cores" title="Per-core load"></div></div>
+    <div class="card tile"><div class="k">Memory pressure</div><div class="v" id="tMem">-</div><div class="sub num" id="tMemSub">&nbsp;</div></div>
+    <div class="card tile"><div class="k">Swap used</div><div class="v num" id="tSwap">-</div><div class="sub num" id="tSwapSub">&nbsp;</div></div>
+    <div class="card tile"><div class="k">Disk free</div><div class="v num" id="tDisk">-</div><div class="sub num" id="tDiskSub">&nbsp;</div></div>
+    <div class="card tile"><div class="k">Network</div><div class="v two num" id="tNet">-</div><div class="sub" id="tNetSub">&nbsp;</div></div>
+    <div class="card tile"><div class="k">Thermal</div><div class="v small" id="tTherm">-</div><div class="sub" id="tThermSub">&nbsp;</div></div>
+  </section>
+
+  <section class="toolbar" id="toolbar">
+    <div class="seg" id="ranges" role="group" aria-label="Chart time range">
+      <button data-r="15m">15m</button><button data-r="1h">1h</button><button data-r="6h">6h</button><button data-r="24h">24h</button><button data-r="7d">7d</button>
+    </div>
+    <div class="view"><span class="spin" id="histSpin"></span><span id="viewText">Live</span>
+      <button class="btn" id="backLive" hidden>Back to live</button></div>
+  </section>
+
+  <section class="charts" id="charts">
+    <div class="card chart pick" id="cCpu"><div class="chead"><h2>CPU<span class="hint">click a point for its processes</span></h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
+    <div class="card chart pick" id="cMem"><div class="chead"><h2>Memory</h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
+    <div class="card chart pick" id="cDisk"><div class="chead"><h2>Disk IO</h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
+    <div class="card chart pick" id="cNet"><div class="chead"><h2>Network</h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
+  </section>
+
+  <section class="panels">
+    <div class="card panel" id="procPanel">
+      <div class="phead"><h2 style="flex:1 1 auto">Top processes</h2>
+        <div class="seg" id="sorts" role="group" aria-label="Sort processes by"><button data-s="cpu" aria-pressed="true">CPU</button><button data-s="mem" aria-pressed="false">Memory</button></div>
+        <div class="seg" id="groupSeg" role="group" aria-label="Rows"><button data-g="0" aria-pressed="true">Each process</button><button data-g="1" aria-pressed="false">By name</button></div></div>
+      <div class="pwhen"><span class="spin" id="procSpin"></span><span id="procWhen">Live</span><button class="btn" id="procLive" hidden>Back to live</button></div>
+      <table><thead><tr><th>Process</th><th id="thPid">PID</th><th id="thCpu">CPU %</th><th id="thMem">Memory</th></tr></thead><tbody id="procBody"></tbody></table>
+      <div class="none" id="procNone" hidden></div>
+    </div>
+    <div class="card panel" id="evPanel">
+      <div class="phead"><h2>Events</h2><span class="sub" style="color:var(--muted);font-size:12px" id="evCount"></span></div>
+      <div class="evlist" id="evList"></div>
+      <div class="none" id="evNone" hidden>No events recorded. One appears when CPU stays high, memory pressure rises, swap grows, a disk runs low or the CPU is throttled.</div>
+    </div>
+  </section>
+
+  <footer><span id="footSampler"></span><span>JSON: <a href="/api/now">/api/now</a> · <a href="/api/history?range=1h">/api/history</a> · <a href="/api/events">/api/events</a> · <a href="/api/processes">/api/processes</a></span></footer>
+</main>
+
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const RANGE_S = {"15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800};
+const state = { range: "1h", end: null, hist: null, now: null, sort: "cpu", group: false, pin: null, selEvent: null, events: [], hover: null, histToken: 0 };
+try { const r = localStorage.getItem("mm.range"); if (RANGE_S[r]) state.range = r; } catch (e) {}
+
+// ---------- formatting ----------
+function fmtBytes(n, digits) {
+  n = +n || 0; const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
+  while (Math.abs(n) >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  const d = digits != null ? digits : (i < 2 ? 0 : (n >= 100 ? 0 : 1));
+  return n.toFixed(d) + " " + u[i];
+}
+const fmtRate = n => fmtBytes(n) + "/s";
+function fmtAxisBytes(v) { let n = v, i = 0; while (n >= 1024 && i < 4) { n /= 1024; i++; } return fmtBytes(v, Number.isInteger(n) ? 0 : 1); }
+const fmtPct = n => (n == null ? "-" : (+n).toFixed(n >= 99.95 || n < 10 ? (n >= 99.95 ? 0 : 1) : 0) + "%");
+const pad = n => String(n).padStart(2, "0");
+function fmtClock(ts, secs) { const d = new Date(ts * 1000); return pad(d.getHours()) + ":" + pad(d.getMinutes()) + (secs ? ":" + pad(d.getSeconds()) : ""); }
+function fmtDay(ts) { return new Date(ts * 1000).toLocaleDateString(undefined, {weekday: "short", day: "numeric", month: "short"}); }
+function fmtWhen(ts, secs) {
+  const d = new Date(ts * 1000), n = new Date();
+  return (d.toDateString() === n.toDateString() ? "" : fmtDay(ts) + " ") + fmtClock(ts, secs);
+}
+function fmtDur(s) {
+  s = Math.max(0, Math.round(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+  if (d) return d + "d " + h + "h"; if (h) return h + "h " + m + "m"; if (m) return m + "m " + (s % 60) + "s"; return s + "s";
+}
+function el(tag, cls, text) { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; }
+function badge(kind, text) { const b = el("span", "badge " + kind); b.appendChild(el("i")); b.appendChild(document.createTextNode(text)); return b; }
+async function getJSON(url) { const r = await fetch(url, {cache: "no-store"}); if (!r.ok) throw new Error(url + " " + r.status); return r.json(); }
+
+// ---------- charts ----------
+const css = () => getComputedStyle(document.documentElement);
+function niceCeil(v, base) {
+  if (!(v > 0)) return base === 1024 ? 1024 : 1;
+  const unit = Math.pow(base, Math.floor(Math.log(v) / Math.log(base) + 1e-9));
+  const m = v / unit;
+  for (const s of [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 1024]) if (s >= m * 0.999 && s <= base) return s * unit;
+  return base * unit;
+}
+const X_STEPS = [60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800];
+
+class Chart {
+  constructor(id, cfg) {
+    this.root = $(id); this.cfg = cfg;
+    this.canvas = this.root.querySelector("canvas"); this.tip = this.root.querySelector(".tip");
+    this.emptyEl = this.root.querySelector(".empty");
+    const lg = this.root.querySelector(".legend");
+    for (const s of cfg.series) { const sp = el("span"); const sw = el("i", "sw" + (s.type === "line" ? " line" : "")); sw.style.background = "var(" + s.color + ")"; sp.appendChild(sw); sp.appendChild(document.createTextNode(s.label)); lg.appendChild(sp); }
+    this.canvas.addEventListener("pointermove", e => this.onMove(e));
+    this.canvas.addEventListener("pointerdown", e => this.onMove(e));
+    this.canvas.addEventListener("pointerleave", () => { state.hover = null; this.tip.style.display = "none"; drawAll(); });
+    this.canvas.addEventListener("click", e => { const h = this.locate(e); if (h) pickTime(h.t); });
+    new ResizeObserver(() => this.draw()).observe(this.canvas);
+  }
+  geom() {
+    const r = this.canvas.getBoundingClientRect();
+    return {w: r.width, h: r.height, l: this.gutter || 48, r: 10, t: 10, b: 22};
+  }
+  xOf(t, g) { const h = state.hist; return g.l + (t - h.start) / (h.end - h.start) * (g.w - g.l - g.r); }
+  locate(e) {
+    const h = state.hist; if (!h || !h.series.t.length) return null;
+    const g = this.geom(), r = this.canvas.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    const t = h.start + (x - g.l) / (g.w - g.l - g.r) * (h.end - h.start);
+    const ts = h.series.t; let lo = 0, hi = ts.length - 1;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (ts[mid] < t) lo = mid + 1; else hi = mid; }
+    if (lo > 0 && Math.abs(ts[lo - 1] - t) < Math.abs(ts[lo] - t)) lo--;
+    if (Math.abs(ts[lo] - t) > Math.max(h.bucket * 2, (h.end - h.start) / 40)) return null;
+    return {i: lo, t: ts[lo], x};
+  }
+  onMove(e) {
+    const h = this.locate(e);
+    state.hover = h ? {i: h.i, t: h.t, chart: this} : null;
+    drawAll();
+    if (!h) { this.tip.style.display = "none"; return; }
+    this.showTip(h);
+  }
+  showTip(h) {
+    const hist = state.hist, tip = this.tip; tip.textContent = "";
+    const head = fmtWhen(h.t, hist.bucket < 60) + (hist.bucket > 5 ? " · " + fmtDur(hist.bucket) + " average" : "");
+    tip.appendChild(el("div", "tt", head));
+    for (const row of this.cfg.tipRows(hist.series, h.i)) {
+      const r = el("div", "row"); const sw = el("i", "sw" + (row.line ? " line" : ""));
+      sw.style.background = row.color ? "var(" + row.color + ")" : "transparent";
+      r.appendChild(sw); r.appendChild(el("span", "", row.label)); r.appendChild(el("b", "num", row.value)); tip.appendChild(r);
+    }
+    tip.style.display = "block";
+    const g = this.geom(), x = this.xOf(h.t, g), tw = tip.offsetWidth;
+    let left = x + 12; if (left + tw > g.w - 4) left = x - 12 - tw; if (left < 4) left = 4;
+    tip.style.left = left + "px";
+  }
+  draw() {
+    const hist = state.hist, cv = this.canvas, g = this.geom();
+    if (!g.w || !g.h) return;
+    const dpr = window.devicePixelRatio || 1;
+    if (cv.width !== Math.round(g.w * dpr) || cv.height !== Math.round(g.h * dpr)) { cv.width = Math.round(g.w * dpr); cv.height = Math.round(g.h * dpr); }
+    const c = cv.getContext("2d"); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, g.w, g.h);
+    const st = css(), col = n => st.getPropertyValue(n).trim();
+    const pw = g.w - g.l - g.r, ph = g.h - g.t - g.b, y0 = g.t + ph;
+    c.font = "11px -apple-system, BlinkMacSystemFont, sans-serif";
+    const has = hist && hist.series.t.length > 0;
+    this.emptyEl.style.display = hist && !has ? "flex" : "none";
+    if (hist && !has) this.emptyEl.textContent = "No samples in this window" + (hist.live ? " yet. They appear within a few seconds." : ". The monitor was not running then.");
+    if (!hist) return;
+    const S = hist.series, T = S.t, n = T.length, cfg = this.cfg;
+
+    // y scale
+    let vmax = 0;
+    for (let i = 0; i < n; i++) {
+      let stack = 0;
+      for (const s of cfg.series) { const v = S[s.key][i] || 0; if (s.type === "area") stack += v; else if (v > vmax) vmax = v; }
+      if (stack > vmax) vmax = stack;
+    }
+    const ymax = cfg.yMax ? cfg.yMax(vmax) : niceCeil(vmax, cfg.base || 1000);
+    const yOf = v => y0 - Math.min(v, ymax) / ymax * ph;
+    const want = Math.ceil(Math.max(...[0, .5, 1].map(f => c.measureText(cfg.fmtAxis(ymax * f)).width))) + 12;
+    if (want !== g.l) { this.gutter = want; return this.draw(); }
+
+    // grid + y labels
+    c.lineWidth = 1; c.textBaseline = "middle"; c.textAlign = "right";
+    for (const f of [0, .5, 1]) {
+      const y = Math.round(y0 - f * ph) + .5;
+      c.strokeStyle = col("--grid"); c.beginPath(); c.moveTo(g.l, y); c.lineTo(g.w - g.r, y); c.stroke();
+      c.fillStyle = col("--muted"); c.fillText(cfg.fmtAxis(ymax * f), g.l - 6, y);
+    }
+    // x labels
+    const span = hist.end - hist.start, maxTicks = Math.max(2, Math.floor(pw / 80));
+    const step = X_STEPS.find(s => span / s <= maxTicks) || 172800;
+    const off = new Date(hist.end * 1000).getTimezoneOffset() * 60;
+    c.textBaseline = "alphabetic"; c.textAlign = "center"; c.fillStyle = col("--muted");
+    for (let t = Math.ceil((hist.start - off) / step) * step + off; t <= hist.end; t += step) {
+      const x = this.xOf(t, g); if (x < g.l + 14 || x > g.w - g.r - 14) continue;
+      const d = new Date(t * 1000), midnight = d.getHours() === 0 && d.getMinutes() === 0;
+      c.fillText(step >= 86400 || midnight ? d.toLocaleDateString(undefined, {weekday: "short", day: "numeric"}) : fmtClock(t), x, g.h - 6);
+    }
+
+    // event spans and markers
+    for (const ev of hist.events) {
+      const colr = col(ev.severity === "critical" ? "--critical" : "--warning");
+      const x1 = Math.max(g.l, this.xOf(ev.ts, g)), x2 = Math.min(g.w - g.r, this.xOf(ev.end_ts || hist.end, g));
+      if (x2 < g.l || x1 > g.w - g.r) continue;
+      c.fillStyle = colr; c.globalAlpha = .10; c.fillRect(x1, g.t, Math.max(1, x2 - x1), ph); c.globalAlpha = 1;
+      if (ev.ts >= hist.start) { c.beginPath(); c.moveTo(x1 - 4, g.t - 6); c.lineTo(x1 + 4, g.t - 6); c.lineTo(x1, g.t + 1); c.closePath(); c.fill(); }
+    }
+
+    // contiguous runs (a gap means the monitor was not running)
+    const runs = []; let a = 0;
+    for (let i = 1; i <= n; i++) if (i === n || T[i] - T[i - 1] > hist.bucket * 2.5) { runs.push([a, i - 1]); a = i; }
+    const X = new Array(n); for (let i = 0; i < n; i++) X[i] = this.xOf(T[i], g);
+    const base = new Float64Array(n);
+    c.save(); c.beginPath(); c.rect(g.l, g.t - 1, pw, ph + 2); c.clip();
+    for (const s of cfg.series) {
+      const V = S[s.key], colr = col(s.color);
+      for (const [i0, i1] of runs) {
+        if (s.type === "area") {
+          const lone = i0 === i1, dx = lone ? 1.5 : 0;
+          c.beginPath();
+          c.moveTo(X[i0] - dx, yOf(base[i0] + (V[i0] || 0)));
+          for (let i = i0; i <= i1; i++) c.lineTo(X[i] + (lone ? dx : 0), yOf(base[i] + (V[i] || 0)));
+          for (let i = i1; i >= i0; i--) c.lineTo(X[i] + (lone ? dx : 0), yOf(base[i]));
+          if (lone) c.lineTo(X[i0] - dx, yOf(base[i0]));
+          c.closePath(); c.fillStyle = colr; c.globalAlpha = .82; c.fill(); c.globalAlpha = 1;
+          // surface-coloured top edge keeps stacked bands apart
+          c.beginPath(); for (let i = i0; i <= i1; i++) { const y = yOf(base[i] + (V[i] || 0)); i === i0 ? c.moveTo(X[i], y) : c.lineTo(X[i], y); }
+          c.strokeStyle = col("--surface"); c.lineWidth = 1; c.stroke();
+        } else {
+          c.beginPath(); c.lineJoin = "round"; c.lineCap = "round";
+          for (let i = i0; i <= i1; i++) { const y = yOf(V[i] || 0); i === i0 ? c.moveTo(X[i], y) : c.lineTo(X[i], y); }
+          if (i0 === i1) c.lineTo(X[i0] + .01, yOf(V[i0] || 0));
+          c.strokeStyle = colr; c.lineWidth = s.thin ? 1.25 : 2; if (s.thin) c.setLineDash([3, 3]); c.stroke(); c.setLineDash([]);
+        }
+      }
+      if (s.type === "area") for (let i = 0; i < n; i++) base[i] += V[i] || 0;
+    }
+    c.restore();
+
+    // pinned time, then hover crosshair
+    if (state.pin && state.pin.ts >= hist.start && state.pin.ts <= hist.end) {
+      const x = Math.round(this.xOf(state.pin.ts, g)) + .5;
+      c.strokeStyle = col("--text"); c.lineWidth = 1.5; c.beginPath(); c.moveTo(x, g.t); c.lineTo(x, y0); c.stroke();
+      c.fillStyle = col("--text"); c.beginPath(); c.arc(x, g.t, 3.5, 0, 6.3); c.fill();
+    }
+    if (state.hover && state.hover.i < n) {
+      const i = state.hover.i, x = Math.round(X[i]) + .5;
+      c.strokeStyle = col("--muted"); c.lineWidth = 1; c.beginPath(); c.moveTo(x, g.t); c.lineTo(x, y0); c.stroke();
+      let acc = 0;
+      for (const s of cfg.series) {
+        const v = S[s.key][i] || 0, y = yOf(s.type === "area" ? (acc += v) : v);
+        c.beginPath(); c.arc(X[i], y, 4, 0, 6.3); c.fillStyle = col("--surface"); c.fill();
+        c.beginPath(); c.arc(X[i], y, 3, 0, 6.3); c.fillStyle = col(s.color); c.fill();
+      }
+    }
+  }
+}
+
+const charts = [
+  new Chart("cCpu", {
+    series: [{key: "cpu_user", label: "User", color: "--s1", type: "area"}, {key: "cpu_sys", label: "System", color: "--s2", type: "area"},
+             {key: "cpu_peak", label: "Peak in interval", color: "--text-2", type: "line", thin: true}],
+    yMax: () => 100, fmtAxis: v => v.toFixed(0) + "%",
+    tipRows: (S, i) => [
+      {label: "User", color: "--s1", value: S.cpu_user[i].toFixed(1) + "%"}, {label: "System", color: "--s2", value: S.cpu_sys[i].toFixed(1) + "%"},
+      {label: "Total", value: (S.cpu_user[i] + S.cpu_sys[i]).toFixed(1) + "%"}, {label: "Peak", color: "--text-2", line: true, value: S.cpu_peak[i].toFixed(1) + "%"},
+      {label: "Load (1m)", value: S.load1[i].toFixed(2)}],
+  }),
+  new Chart("cMem", {
+    series: [{key: "mem_app", label: "App", color: "--s1", type: "area"}, {key: "mem_wired", label: "Wired", color: "--s2", type: "area"},
+             {key: "mem_compressed", label: "Compressed", color: "--s3", type: "area"}, {key: "swap_used", label: "Swap", color: "--s4", type: "line"}],
+    yMax: v => Math.max(v, state.now && state.now.host ? state.now.host.mem_total : 0) || niceCeil(v, 1024),
+    fmtAxis: v => fmtAxisBytes(v),
+    tipRows: (S, i) => [
+      {label: "App", color: "--s1", value: fmtBytes(S.mem_app[i])}, {label: "Wired", color: "--s2", value: fmtBytes(S.mem_wired[i])},
+      {label: "Compressed", color: "--s3", value: fmtBytes(S.mem_compressed[i])}, {label: "Used", value: fmtBytes(S.mem_app[i] + S.mem_wired[i] + S.mem_compressed[i])},
+      {label: "Swap", color: "--s4", line: true, value: fmtBytes(S.swap_used[i])},
+      {label: "Pressure", value: ({1: "Normal", 2: "Warn", 4: "Critical"})[S.pressure[i]] || "-"}],
+  }),
+  new Chart("cDisk", {
+    series: [{key: "disk_read", label: "Read", color: "--s1", type: "line"}, {key: "disk_write", label: "Write", color: "--s2", type: "line"}],
+    base: 1024, fmtAxis: v => fmtAxisBytes(v) + "/s",
+    tipRows: (S, i) => [{label: "Read", color: "--s1", line: true, value: fmtRate(S.disk_read[i])}, {label: "Write", color: "--s2", line: true, value: fmtRate(S.disk_write[i])}],
+  }),
+  new Chart("cNet", {
+    series: [{key: "net_in", label: "In", color: "--s1", type: "line"}, {key: "net_out", label: "Out", color: "--s2", type: "line"}],
+    base: 1024, fmtAxis: v => fmtAxisBytes(v) + "/s",
+    tipRows: (S, i) => [{label: "In", color: "--s1", line: true, value: fmtRate(S.net_in[i])}, {label: "Out", color: "--s2", line: true, value: fmtRate(S.net_out[i])}],
+  }),
+];
+let drawQueued = false;
+function drawAll() { if (drawQueued) return; drawQueued = true; requestAnimationFrame(() => { drawQueued = false; charts.forEach(ch => ch.draw()); }); }
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+
+// ---------- history ----------
+function setChartsLoading(on) {
+  charts.forEach(ch => ch.root.classList.toggle("loading", on));
+  $("histSpin").classList.toggle("on", on);
+}
+function renderView() {
+  const h = state.hist, live = state.end == null;
+  for (const b of $("ranges").children) b.setAttribute("aria-pressed", String(b.dataset.r === state.range));
+  $("backLive").hidden = live && !state.pin;
+  if (state.histLoading) { $("viewText").textContent = "Loading " + state.range + (live ? "" : " around " + fmtWhen(state.end - RANGE_S[state.range] / 2)) + "…"; return; }
+  if (!h) { $("viewText").textContent = ""; return; }
+  $("viewText").textContent = (live ? "Live · " : "History · ") + fmtWhen(h.start) + " to " + fmtWhen(h.end) + (h.bucket > 5 ? " · " + fmtDur(h.bucket) + " averages" : "");
+}
+async function loadHistory(showLoading) {
+  const token = ++state.histToken;
+  if (showLoading) { state.histLoading = true; setChartsLoading(true); renderView(); }
+  try {
+    const h = await getJSON("/api/history?range=" + state.range + (state.end ? "&end=" + state.end : ""));
+    if (token !== state.histToken) return;
+    state.hist = h; state.hover = null; charts.forEach(ch => ch.tip.style.display = "none");
+  } catch (e) { if (token !== state.histToken) return; }
+  state.histLoading = false; setChartsLoading(false); renderView(); drawAll();
+}
+$("ranges").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b || b.dataset.r === state.range) return;
+  state.range = b.dataset.r; try { localStorage.setItem("mm.range", state.range); } catch (err) {}
+  if (state.end != null && state.pin) state.end = centerEnd(state.pin.ts);
+  loadHistory(true);
+});
+function centerEnd(ts) { const e = Math.round(ts + RANGE_S[state.range] / 2); return e >= Date.now() / 1000 - 5 ? null : e; }
+function backToLive() { state.end = null; state.pin = null; state.selEvent = null; renderEvents(); renderProcs(); loadHistory(true); }
+$("backLive").addEventListener("click", backToLive);
+$("procLive").addEventListener("click", backToLive);
+
+// ---------- processes ----------
+function renderProcs() {
+  const pin = state.pin, panel = $("procPanel");
+  for (const b of $("sorts").children) b.setAttribute("aria-pressed", String(b.dataset.s === state.sort));
+  for (const b of $("groupSeg").children) b.setAttribute("aria-pressed", String((b.dataset.g === "1") === state.group));
+  $("thPid").textContent = state.group ? "Count" : "PID";
+  $("thCpu").classList.toggle("sorted", state.sort === "cpu"); $("thMem").classList.toggle("sorted", state.sort === "mem");
+  const loading = !!(pin && pin.loading);
+  panel.classList.toggle("loading", loading); $("procSpin").classList.toggle("on", loading);
+  $("procLive").hidden = !pin;
+  let data = null, when;
+  if (pin) {
+    if (loading) when = "Loading processes at " + fmtWhen(pin.ts, true) + "…";
+    else if (pin.data && pin.data.ts) { data = pin.data; when = "Recorded at " + fmtWhen(pin.data.ts, true) + (pin.data.cpu != null ? " · CPU " + fmtPct(pin.data.cpu) : "") + (pin.label ? " · " + pin.label : ""); }
+    else when = pin.error || "Nothing was recorded near " + fmtWhen(pin.ts, true);
+  } else if (state.now && state.now.ready) { data = state.now.top; when = "Live · top " + state.now.top.by_cpu.length + " of " + state.now.nproc + " processes"; }
+  else when = "Waiting for first sample…";
+  $("procWhen").textContent = when;
+  if (loading) return;            // keep the previous rows dimmed until the new ones arrive
+  const key = state.sort === "cpu" ? "cpu" : "rss";
+  const rows = !data ? [] : state.group ? (data.by_name || []).slice().sort((a, b) => b[key] - a[key]).slice(0, 10)
+    : (state.sort === "cpu" ? data.by_cpu : data.by_mem);
+  const body = $("procBody"); body.textContent = "";
+  const maxCpu = Math.max(100, ...rows.map(p => p.cpu)), maxRss = Math.max(1, ...rows.map(p => p.rss));
+  for (const p of rows) {
+    const tr = el("tr"); const name = el("td", "", p.name); name.title = p.name; tr.appendChild(name);
+    tr.appendChild(el("td", "num", state.group ? "\u00d7" + p.count : p.pid));
+    for (const [txt, frac, on] of [[p.cpu.toFixed(1), p.cpu / maxCpu, state.sort === "cpu"], [fmtBytes(p.rss), p.rss / maxRss, state.sort === "mem"]]) {
+      const td = el("td", "num" + (on ? " bar" : ""), txt);
+      if (on) { const i = el("i"), b = el("b"); b.style.width = Math.max(0, Math.min(100, frac * 100)) + "%"; i.appendChild(b); td.appendChild(i); }
+      tr.appendChild(td);
+    }
+    body.appendChild(tr);
+  }
+  $("procNone").hidden = rows.length > 0 || !pin; $("procNone").textContent = pin && !rows.length ? "No process list for that moment." : "";
+}
+$("sorts").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; state.sort = b.dataset.s; renderProcs(); });
+$("groupSeg").addEventListener("click", e => { const b = e.target.closest("button"); if (!b) return; state.group = b.dataset.g === "1"; renderProcs(); });
+
+async function pickTime(t) {
+  state.selEvent = null; state.pin = {ts: t, loading: true};
+  renderEvents(); renderProcs(); renderView(); drawAll();
+  const pin = state.pin;
+  try { pin.data = await getJSON("/api/processes?at=" + t + "&window=" + (state.hist ? state.hist.bucket : 0)); }
+  catch (e) { pin.error = "Could not load processes for " + fmtWhen(t, true); }
+  pin.loading = false;
+  if (state.pin === pin) renderProcs();
+}
+
+// ---------- events ----------
+function renderEvents() {
+  const list = $("evList"); list.textContent = "";
+  $("evNone").hidden = state.events.length > 0; $("evCount").textContent = state.events.length ? state.events.length + " in the last 7 days" : "";
+  for (const ev of state.events) {
+    const b = el("button", "ev" + (ev.id === state.selEvent ? " sel" : "")); b.type = "button";
+    b.setAttribute("aria-pressed", String(ev.id === state.selEvent));
+    b.appendChild(badge(ev.severity === "critical" ? "critical" : "warning", ev.severity === "critical" ? "Critical" : "Warning"));
+    b.appendChild(el("span", "t", ev.title));
+    const peak = ev.unit === "level" ? "" : " · peak " + (+ev.peak).toFixed(ev.unit === "MB" ? 0 : 1) + (ev.unit === "%" ? "%" : " " + ev.unit);
+    b.appendChild(el("span", "m num", fmtWhen(ev.ts, true) + " · " + (ev.active ? "ongoing for " + fmtDur(Date.now() / 1000 - ev.ts) : "lasted " + fmtDur(ev.end_ts - ev.ts)) + peak));
+    b.addEventListener("click", () => selectEvent(ev));
+    list.appendChild(b);
+  }
+}
+function selectEvent(ev) {
+  state.selEvent = ev.id;
+  if (RANGE_S[state.range] > 3600) state.range = "1h";
+  state.end = centerEnd(ev.ts);
+  state.pin = {ts: ev.ts, loading: false, label: ev.title, data: Object.assign({ts: ev.ts, cpu: null}, ev.processes)};
+  renderEvents(); renderProcs(); loadHistory(true);
+  if ($("charts").getBoundingClientRect().top < 0) $("toolbar").scrollIntoView({behavior: "smooth", block: "start"});
+}
+async function loadEvents() {
+  try { state.events = (await getJSON("/api/events?limit=200")).events; renderEvents(); } catch (e) {}
+}
+
+// ---------- live tiles ----------
+function renderNow() {
+  const s = state.now; if (!s) return;
+  const h = s.host;
+  if (!s.ready) { $("hostline").textContent = h.name + " · " + h.model; return; }
+  $("hostline").textContent = [h.name, h.model, h.ncpu + " cores", fmtBytes(h.mem_total, 0) + " RAM", "up " + fmtDur(s.uptime_s), s.nproc + " processes"].join(" · ");
+  $("tCpu").textContent = fmtPct(s.cpu.busy);
+  $("tCpuSub").textContent = "user " + s.cpu.user.toFixed(0) + "% · sys " + s.cpu.sys.toFixed(0) + "% · load " + s.cpu.load[0].toFixed(1);
+  const cores = $("cores");
+  if (cores.children.length !== s.cpu.per_core.length) { cores.textContent = ""; s.cpu.per_core.forEach(() => { const sp = el("span"); sp.appendChild(el("b")); cores.appendChild(sp); }); }
+  s.cpu.per_core.forEach((v, i) => { cores.children[i].firstChild.style.height = v + "%"; cores.children[i].title = "Core " + i + ": " + v.toFixed(0) + "%"; });
+  const pk = s.mem.pressure === "critical" ? "critical" : s.mem.pressure === "warn" ? "warning" : s.mem.pressure === "normal" ? "good" : "na";
+  const tm = $("tMem"); tm.textContent = ""; tm.appendChild(badge(pk, ({normal: "Normal", warn: "Warn", critical: "Critical"})[s.mem.pressure] || "Unknown"));
+  tm.firstChild.style.fontSize = "15px"; tm.firstChild.style.padding = "2px 10px 2px 8px";
+  $("tMemSub").textContent = fmtBytes(s.mem.used) + " of " + fmtBytes(s.mem.total, 0) + " used · " + fmtBytes(s.mem.compressed) + " compressed";
+  $("tSwap").textContent = fmtBytes(s.swap.used);
+  $("tSwapSub").textContent = s.swap.total ? "of " + fmtBytes(s.swap.total) + " · in " + fmtRate(s.swap.in_bps) + " · out " + fmtRate(s.swap.out_bps) : "no swap file in use";
+  const vols = s.disk.volumes.slice().sort((a, b) => a.free_pct - b.free_pct), v = vols[0];
+  if (v) {
+    const td = $("tDisk"); td.textContent = v.free_pct.toFixed(0) + "% ";
+    if (v.free_pct < 10) td.appendChild(badge(v.free_pct < 5 ? "critical" : "warning", "Low"));
+    $("tDiskSub").textContent = fmtBytes(v.free) + " of " + fmtBytes(v.total) + " · " + v.mount + (vols.length > 1 ? " (lowest of " + vols.length + ")" : "") + " · IO " + fmtRate(s.disk.read_bps + s.disk.write_bps);
+  }
+  const tn = $("tNet"); tn.textContent = ""; tn.appendChild(el("div", "", "↓ " + fmtRate(s.net.in_bps))); tn.appendChild(el("div", "", "↑ " + fmtRate(s.net.out_bps)));
+  const act = Object.entries(s.net.ifaces).filter(([k, x]) => !k.startsWith("lo") && (x.in_bps || x.out_bps)).map(([k]) => k);
+  $("tNetSub").textContent = act.length ? act.join(", ") : "idle";
+  const th = s.thermal, tt = $("tTherm"); tt.textContent = "";
+  if (th.speed_limit == null) { tt.appendChild(badge("na", "Not reported")); tt.firstChild.style.fontSize = "13.5px"; $("tThermSub").textContent = "pmset gives no CPU speed limit on this Mac"; }
+  else { tt.appendChild(badge(th.speed_limit < 100 ? "warning" : "good", th.speed_limit < 100 ? "Throttled " + th.speed_limit + "%" : "Normal")); tt.firstChild.style.fontSize = "15px"; $("tThermSub").textContent = "CPU speed limit " + th.speed_limit + "%"; }
+  const sm = s.sampler;
+  $("footSampler").textContent = "Sampling every " + sm.interval_s + "s · sampler cost " + (sm.overhead_pct_of_one_core == null ? "-" : sm.overhead_pct_of_one_core.toFixed(2) + "% of one core") + " · " + sm.samples_this_run + " samples this run";
+}
+let lastOk = 0, ticks = 0;
+async function tick() {
+  try {
+    state.now = await getJSON("/api/now"); lastOk = Date.now();
+    const c = $("conn"); c.classList.remove("stale", "tick"); void c.offsetWidth; c.classList.add("tick");
+    $("connText").textContent = state.now.ready ? "Live · updated " + fmtClock(state.now.ts, true) : "Waiting for first sample…";
+    renderNow(); if (!state.pin) renderProcs();
+  } catch (e) {
+    $("conn").classList.add("stale");
+    $("connText").textContent = "Monitor not responding" + (lastOk ? " since " + fmtClock(lastOk / 1000, true) : "") + " · retrying";
+  }
+  ticks++;
+  if (ticks % 2 === 0) { loadEvents(); if (state.end == null && !state.histLoading && !state.hover) loadHistory(false); }
+}
+renderView(); renderProcs();
+loadHistory(true); loadEvents(); tick(); setInterval(tick, 5000);
+</script>
+</body>
+</html>

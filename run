@@ -1,0 +1,5 @@
+#!/bin/sh
+# Start mac-monitor in the foreground. Ctrl-C stops it.
+# MAC_MONITOR_PORT overrides the port (default: first free port in 5180-5199).
+cd "$(dirname "$0")" || exit 1
+exec /usr/bin/env python3 monitor.py serve

@@ -1,0 +1,4 @@
+#!/bin/sh
+# Print a one-shot plain-text diagnostic report (works whether or not ./run is up).
+cd "$(dirname "$0")" || exit 1
+exec /usr/bin/env python3 monitor.py snapshot
