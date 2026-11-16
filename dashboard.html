@@ -63,6 +63,8 @@ header { display: flex; flex-wrap: wrap; gap: 4px 16px; align-items: baseline; j
 .netsum b { color: var(--text); font-weight: 600; }
 .speed { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; font-size: 12px; color: var(--text-2); padding: 6px 0 3px; border-top: 1px solid var(--grid); margin-top: 4px; min-height: 38px; }
 .btn[disabled] { opacity: .6; cursor: default; }
+.notif { display: flex; flex-wrap: wrap; gap: 6px 8px; align-items: center; margin-left: auto; font-size: 12.5px; color: var(--text-2); min-width: 0; }
+.notif .seg button[disabled] { opacity: .5; cursor: default; }
 .tile { padding: 11px 13px 12px; }
 .tile .k { font-size: 12px; color: var(--text-2); display: flex; align-items: center; gap: 6px; }
 .tile .v { font-size: 22px; font-weight: 620; letter-spacing: -.01em; margin-top: 3px; line-height: 1.2; overflow-wrap: anywhere; }
@@ -196,6 +198,9 @@ footer a { color: var(--text-2); }
     </div>
     <div class="view"><span class="spin" id="histSpin"></span><span id="viewText">Live</span>
       <button class="btn" id="backLive" hidden>Back to live</button></div>
+    <div class="notif"><span>Alerts</span>
+      <div class="seg" id="notifSeg" role="group" aria-label="macOS notifications"><button data-a="on" aria-pressed="false">On</button><button data-a="mute" aria-pressed="false">Mute 1h</button><button data-a="off" aria-pressed="false">Off</button></div>
+      <button class="btn" id="notifTest" type="button">Send test</button><span class="spin" id="notifSpin"></span><span id="notifText" class="num"></span></div>
   </section>
 
   <section class="charts" id="charts">
@@ -535,6 +540,31 @@ function renderNetSummary() {
   add("Latency", s.latency_median_ms == null ? "-" : "median " + s.latency_median_ms.toFixed(0) + " ms, worst " + s.latency_worst_ms.toFixed(0) + " ms");
   add("Loss", s.loss_pct == null ? "-" : s.loss_pct.toFixed(s.loss_pct ? 2 : 0) + "%");
 }
+// ---------- notifications ----------
+let notifBusy = false, notifNote = null, notifNoteTimer = null;
+function renderNotif(st, pending) {
+  st = st || (state.now && state.now.notifications); if (!st) return;
+  const sel = pending || ({on: "on", muted: "mute", off: "off"})[st.state];
+  for (const b of $("notifSeg").children) { b.setAttribute("aria-pressed", String(b.dataset.a === sel)); b.disabled = st.state === "disabled"; }
+  $("notifSpin").classList.toggle("on", notifBusy);
+  $("notifTest").disabled = notifBusy;
+  $("notifText").textContent = notifNote || (pending ? "Saving..." : ({on: "macOS banner when a problem starts", muted: "Muted until " + fmtWhen(st.muted_until || 0), off: "Off until switched back on", disabled: "Disabled in monitor.py"})[st.state]);
+}
+async function notifPost(body) { const r = await fetch("/api/notifications", {method: "POST", headers: {"X-Mac-Monitor": "1", "Content-Type": "application/json"}, body: JSON.stringify(body)}); if (!r.ok) throw new Error(r.status); return r.json(); }
+function setNotifNote(t, ms) { notifNote = t; clearTimeout(notifNoteTimer); if (t && ms) notifNoteTimer = setTimeout(() => { notifNote = null; renderNotif(); }, ms); }
+$("notifSeg").addEventListener("click", async e => {
+  const b = e.target.closest("button"); if (!b || b.disabled || notifBusy) return;
+  notifBusy = true; setNotifNote(null); renderNotif(null, b.dataset.a);          // lit before the request leaves
+  try { const st = await notifPost({action: b.dataset.a, seconds: 3600}); notifBusy = false; if (state.now) state.now.notifications = st; renderNotif(st); }
+  catch (err) { notifBusy = false; setNotifNote("Could not save that. Is the monitor running?", 8000); renderNotif(); }
+});
+$("notifTest").addEventListener("click", async () => {
+  if (notifBusy) return;
+  notifBusy = true; setNotifNote("Sending test notification..."); renderNotif();
+  try { const st = await notifPost({action: "test"}); notifBusy = false;
+    setNotifNote(st.test.ok ? "Test sent at " + fmtClock(st.test.ts, true) + ". It shows as a Script Editor banner." : "Test failed: " + st.test.error, 15000); renderNotif(st); }
+  catch (err) { notifBusy = false; setNotifNote("Could not send the test. Is the monitor running?", 8000); renderNotif(); }
+});
 // ---------- speed test (only ever on click) ----------
 let speedTimer = null;
 function renderSpeed(st, note) {
@@ -715,7 +745,7 @@ async function tick() {
     state.now = await getJSON("/api/now"); lastOk = Date.now();
     const c = $("conn"); c.classList.remove("stale", "tick"); void c.offsetWidth; c.classList.add("tick");
     $("connText").textContent = state.now.ready ? "Live · updated " + fmtClock(state.now.ts, true) : "Waiting for first sample…";
-    renderNow(); if (!state.pin) renderProcs(); if (!state.hover) drawAll();
+    renderNow(); if (!state.pin) renderProcs(); if (!state.hover) drawAll(); if (!notifBusy) renderNotif();
   } catch (e) {
     $("conn").classList.add("stale");
     $("connText").textContent = "Monitor not responding" + (lastOk ? " since " + fmtClock(lastOk / 1000, true) : "") + " · retrying";

@@ -75,6 +75,25 @@ One event covers the whole incident: it closes when the condition has been
 clear for 60 s (the load event instead closes as soon as load is under its
 lower line). High CPU % on its own is not an event. The thresholds are constants at the top of `monitor.py`.
 
+## Notifications
+
+When an event opens, one macOS banner is posted with what is wrong, the key
+number, the likely culprit and the dashboard address, for example "Load above
+core count: Load 41 on 15 cores - node x36". One more is posted if the event
+turns critical, and "Internet back" with the outage length when an outage ends.
+A rule that flaps open and closed posts at most once every 10 minutes.
+
+The banners are posted with `osascript`, so macOS shows them under
+**Script Editor**. If none appear, allow them in System Settings > Notifications
+> Script Editor (Allow notifications, style Banners or Alerts), and check that
+no Focus mode is hiding them. Clicking a banner opens Script Editor, not the
+dashboard; the address is in the text.
+
+The "Alerts" control in the dashboard switches them On, mutes them for an hour,
+or turns them Off until switched back on; the choice survives restarts. "Send
+test" posts one straight away, even while muted. `NOTIFY_ENABLED`,
+`NOTIFY_RULES` (per rule) and `NOTIFY_COOLDOWN_S` are at the top of `monitor.py`.
+
 ## JSON
 
     /api/now                         latest sample, live process lists, open events
@@ -82,6 +101,7 @@ lower line). High CPU % on its own is not an event. The thresholds are constants
     /api/history?range=1h&end=TS     the window ending at a unix time
     /api/events?limit=100&since=TS   events, newest first, with their process lists
     /api/speedtest                   speed test state and last result (POST with header X-Mac-Monitor: 1 starts one)
+    /api/notifications               POST {"action": "on" | "off" | "mute" | "test", "seconds": 3600}, same header
     /api/processes?at=TS             process lists recorded nearest that unix time
     /api/processes?at=TS&window=240  the busiest sample within that many seconds after TS
 

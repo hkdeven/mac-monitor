@@ -19,6 +19,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import queue
 import threading
 import time
 from collections import deque
@@ -60,6 +61,17 @@ NET_DNS_SLOW_MS = 500.0        # median lookup time while pings are fine
 NET_DNS_SLOW_CLEAR_MS = 300.0
 NET_DNS_FAIL_PCT = 50          # share of lookups failing over the window while pings are fine
 NET_CLEAR_S = 30               # a network event closes after this long back to normal
+
+# macOS notifications (a banner when an event opens)
+NOTIFY_ENABLED = True          # master switch; the dashboard can also mute them
+NOTIFY_RULES = {               # per rule
+    "load_high": True, "net_down": True, "net_loss": True, "net_slow": True, "net_dns": True,
+    "mem_pressure": True, "swap_growing": True, "disk_low": True, "cpu_throttle": True,
+}
+NOTIFY_COOLDOWN_S = 600        # a rule that flaps open and closed posts at most once in this long
+NOTIFY_RECOVERY_KINDS = ("net_down",)   # these also post once when they end
+NOTIFY_TIMEOUT_S = 10          # give up on a notification that takes longer than this to post
+OSASCRIPT = "/usr/bin/osascript"
 
 SAMPLE_INTERVAL_S = 5          # fast metrics: cpu, memory, processes, disk io, network
 SLOW_INTERVAL_S = 30           # slow metrics: df, pmset -g therm
@@ -1018,8 +1030,12 @@ def open_db(readonly=False):
 
 def meta_get(key, default=None):
     """A persisted setting (JSON), readable from any thread."""
+    if not os.path.exists(DB_PATH):
+        return default
     try:
-        con = open_db(readonly=True)
+        # not read-only: at startup no other connection holds the WAL open yet, and
+        # a read-only one cannot open a WAL database on its own
+        con = open_db()
         try:
             row = con.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         finally:
@@ -1071,8 +1087,9 @@ class EventEngine:
     for EVENT_CLEAR_S. One open event per condition key, so a long incident is
     one row with a duration rather than a row per sample."""
 
-    def __init__(self, con):
+    def __init__(self, con, notifier=None):
         self.con = con
+        self.notifier = notifier
         self.pending = {}   # key -> ts the condition first held
         self.active = {}    # key -> {"id", "peak", "clear_since", "higher"}
         self.swap_hist = deque()
@@ -1120,6 +1137,9 @@ class EventEngine:
         j = lambda o: json.dumps(o, separators=(",", ":"))
         self.load_crit_since = (self.load_crit_since or now) if load > crit else None
         act = self.load_event
+        opened = False
+        who = self._culprits(s["top"])
+        body = "Load %.0f on %d cores" % (load, n) + (" - " + who if who else "")
         if act is None:
             if load <= warn:
                 self.load_since = None
@@ -1134,6 +1154,7 @@ class EventEngine:
                  "Load above %g cores for %ds" % (warn, LOAD_SUSTAIN_S), load, load, "load",
                  j(s["top"]["cpu"]), j(s["top"]["mem"]), j(s["top"]["groups"])))
             act = self.load_event = {"id": cur.lastrowid, "peak": load, "critical": False}
+            opened = True
         elif load < clear:
             self.con.execute("UPDATE events SET end_ts=? WHERE id=?", (now, act["id"]))
             self.load_event = self.load_since = None
@@ -1144,12 +1165,18 @@ class EventEngine:
         if (not act["critical"] and self.load_crit_since is not None
                 and now - self.load_crit_since >= LOAD_SUSTAIN_S):
             act["critical"] = True
+            self._notify("critical", "load_high", "load_high",
+                         "Critical: load above %gx core count" % LOAD_CRITICAL_X_NCPU, body)
+            opened = False        # one banner, not two, when it opens already critical
             self.con.execute(
                 "UPDATE events SET severity='critical', title=? WHERE id=?",
                 ("Load above %g (%gx %d cores) for %ds" % (crit, LOAD_CRITICAL_X_NCPU, n, LOAD_SUSTAIN_S),
                  act["id"]))
+        if opened:
+            self._notify("open", "load_high", "load_high", "Load above core count", body)
 
-    def track(self, key, now, opens, stays, sustain, clear_s, kind, sev, title, value, unit, higher, top):
+    def track(self, key, now, opens, stays, sustain, clear_s, kind, sev, title, value, unit, higher, top,
+              retitle=True):
         """One hysteresis rule. Opens after `opens` has held for `sustain` seconds,
         stays open while `stays` holds, closes once `stays` has been false for
         `clear_s`. Severity and title follow the condition while it is open."""
@@ -1161,7 +1188,9 @@ class EventEngine:
                 if (value > act["peak"]) if higher else (value < act["peak"]):
                     act["peak"] = value
                     self.con.execute("UPDATE events SET peak=? WHERE id=?", (value, act["id"]))
-                if opens and (title != act["title"] or sev != act["sev"]):
+                if opens and retitle and (title != act["title"] or sev != act["sev"]):
+                    if sev == "critical" and act["sev"] != "critical":
+                        self._notify_track("critical", key, kind, title, value, unit, top)
                     act["title"], act["sev"] = title, sev
                     self.con.execute("UPDATE events SET title=?, severity=? WHERE id=?", (title, sev, act["id"]))
             else:
@@ -1169,6 +1198,9 @@ class EventEngine:
                     act["clear_since"] = now
                 if now - act["clear_since"] >= clear_s:
                     self.con.execute("UPDATE events SET end_ts=? WHERE id=?", (act["clear_since"], act["id"]))
+                    if kind in NOTIFY_RECOVERY_KINDS:
+                        self._notify_track("recover", key, kind, act["title"], value, unit, top,
+                                           started=act["ts"], ended=act["clear_since"])
                     del self.active[key]
             return
         if not opens:
@@ -1183,7 +1215,9 @@ class EventEngine:
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
             (now, None, kind, sev, title, value, value, unit,
              j(top["cpu"]), j(top["mem"]), j(top["groups"])))
-        self.active[key] = {"id": cur.lastrowid, "peak": value, "clear_since": None, "title": title, "sev": sev}
+        self.active[key] = {"id": cur.lastrowid, "peak": value, "clear_since": None, "title": title,
+                            "sev": sev, "ts": now}
+        self._notify_track("open", key, kind, title, value, unit, top)
 
     def feed_net(self, r, top):
         """Network rules, fed once per finished probe round."""
@@ -1213,40 +1247,43 @@ class EventEngine:
         self.track("net_dns", now, dns_bad, dns_still, 0, NET_CLEAR_S, "net_dns", "warning", title, value, unit, True, top)
 
     def feed(self, s):
-        now = s["ts"]
-        j = lambda o: json.dumps(o, separators=(",", ":"))
         self.feed_load(s)
         for key, holds, sustain, kind, sev, title, value, unit, higher in self.conditions(s):
-            act = self.active.get(key)
-            if act:
-                if holds:
-                    act["clear_since"] = None
-                    worse = value > act["peak"] if higher else value < act["peak"]
-                    if worse:
-                        act["peak"] = value
-                        self.con.execute("UPDATE events SET peak=? WHERE id=?", (value, act["id"]))
-                else:
-                    if act["clear_since"] is None:
-                        act["clear_since"] = now
-                    if now - act["clear_since"] >= EVENT_CLEAR_S:
-                        self.con.execute("UPDATE events SET end_ts=? WHERE id=?",
-                                         (act["clear_since"], act["id"]))
-                        del self.active[key]
-                continue
-            if not holds:
-                self.pending.pop(key, None)
-                continue
-            since = self.pending.setdefault(key, now)
-            # each sample describes the interval before it, hence the + interval
-            if now - since + SAMPLE_INTERVAL_S < sustain:
-                continue
-            self.pending.pop(key, None)
-            cur = self.con.execute(
-                "INSERT INTO events (ts,end_ts,kind,severity,title,value,peak,unit,by_cpu,by_mem,by_name) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (now, None, kind, sev, title, value, value, unit,
-                 j(s["top"]["cpu"]), j(s["top"]["mem"]), j(s["top"]["groups"])))
-            self.active[key] = {"id": cur.lastrowid, "peak": value, "clear_since": None}
+            self.track(key, s["ts"], holds, holds, sustain, EVENT_CLEAR_S, kind, sev, title, value, unit,
+                       higher, s["top"], retitle=kind != "swap_growing")
+
+    # -- notifications: text is put together here, posting happens on the notifier's thread
+    @staticmethod
+    def _culprits(top, by_memory=False):
+        rows = sorted(top.get("groups") or [], key=lambda g: -(g[3] if by_memory else g[2]))[:2]
+        if by_memory:
+            return ", ".join("%s %s" % (g[0], fmt_bytes(g[3] * 1024)) for g in rows)
+        return ", ".join("%s x%d" % (g[0], g[1]) for g in rows if g[2] >= 50)
+
+    def _notify(self, phase, key, kind, title, body):
+        if self.notifier:
+            self.notifier.event(phase, key, kind, title, body)
+
+    def _notify_track(self, phase, key, kind, title, value, unit, top, started=None, ended=None):
+        head, _, where = title.partition(" - ")
+        if phase == "recover":
+            return self._notify(phase, key, kind, "Internet back",
+                                "Was down for %s (%s)" % (fmt_dur(ended - started), where or "cause unknown"))
+        if kind == "net_down":
+            body = where
+        elif kind in ("mem_pressure", "swap_growing"):
+            body = "Using most memory: " + (self._culprits(top, True) or "unknown")
+        elif kind == "disk_low":
+            body = "%.1f%% free" % value
+        elif kind == "net_loss":
+            body = "%.0f%% of pings lost over the last minute" % value
+        elif kind == "net_slow":
+            body = "%.0f %s over the last minute" % (value, unit)
+        elif kind == "net_dns":
+            body = "Pings are fine, so the line is up; name lookups are the problem"
+        else:
+            body = ""
+        self._notify(phase, key, kind, ("Critical: " if phase == "critical" else "") + head, body)
 
 
 # ----------------------------------------------------------------------------
@@ -1262,6 +1299,7 @@ class Sampler(threading.Thread):
         self.samples_taken = 0
         self.started = time.time()
         self.net = NetProbe()
+        self.notifier = None
 
     @staticmethod
     def _cpu_spent():
@@ -1279,7 +1317,7 @@ class Sampler(threading.Thread):
 
     def run(self):
         con = open_db()
-        engine = EventEngine(con)
+        engine = EventEngine(con, self.notifier)
         self.collector.sample()           # prime the counters
         self.net.start()
         next_at = time.monotonic() + 1
@@ -1406,6 +1444,103 @@ def query_events(con, limit=100, since=None):
 
 
 # ----------------------------------------------------------------------------
+# Notifications. `osascript` posts them (they appear under "Script Editor").
+# Text goes in as arguments to a fixed script, never spliced into AppleScript,
+# because process names are arbitrary. Posting happens on this thread with a
+# hard timeout, so a slow or failing osascript cannot hold up sampling.
+# ----------------------------------------------------------------------------
+class Notifier(threading.Thread):
+    SCRIPT = ["-e", "on run argv", "-e",
+              "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run"]
+
+    def __init__(self, url):
+        super().__init__(daemon=True, name="notifier")
+        self.url = url
+        self.q = queue.Queue(maxsize=20)
+        self.lock = threading.Lock()
+        self.posted = {}        # cooldown key -> ts of the last notification
+        self.open_posted = set()  # event keys whose opening was announced (so recovery may be)
+        self.mute = meta_get("notify_mute") or {"until": 0, "off": False}
+        self.last = None        # result of the most recent post
+
+    def state(self):
+        if not NOTIFY_ENABLED:
+            return "disabled"
+        with self.lock:
+            if self.mute.get("off"):
+                return "off"
+            return "muted" if self.mute.get("until", 0) > time.time() else "on"
+
+    def status(self):
+        st = self.state()
+        with self.lock:
+            return {"state": st, "muted_until": self.mute.get("until") if st == "muted" else None,
+                    "cooldown_s": NOTIFY_COOLDOWN_S, "last": self.last,
+                    "rules": {k: bool(v) for k, v in NOTIFY_RULES.items()}}
+
+    def set_mute(self, action, seconds=3600):
+        with self.lock:
+            if action == "on":
+                self.mute = {"until": 0, "off": False}
+            elif action == "off":
+                self.mute = {"until": 0, "off": True}
+            elif action == "mute":
+                self.mute = {"until": int(time.time() + max(60, min(int(seconds), 7 * 86400))), "off": False}
+            else:
+                raise ValueError("unknown action")
+            mute = dict(self.mute)
+        meta_set("notify_mute", mute)
+        return self.status()
+
+    def event(self, phase, key, kind, title, body):
+        """Called from the sampler thread; only ever queues."""
+        now = time.time()
+        if phase == "recover":
+            announced = key in self.open_posted
+            self.open_posted.discard(key)
+            if not announced:
+                return False
+        if self.state() != "on" or not NOTIFY_RULES.get(kind, True):
+            return False
+        ck = kind if phase == "open" else kind + ":" + phase
+        if phase != "recover" and now - self.posted.get(ck, 0) < NOTIFY_COOLDOWN_S:
+            return False
+        self.posted[ck] = now
+        if phase == "open":
+            self.open_posted.add(key)
+        try:
+            self.q.put_nowait((title, body))
+        except queue.Full:
+            return False
+        return True
+
+    def post(self, title, body):
+        """Post now, on the calling thread. Returns {"ts", "title", "body", "ok", "error"}."""
+        text = (body + "  " if body else "") + self.url
+        res = {"ts": int(time.time()), "title": title, "body": text, "ok": False, "error": None}
+        try:
+            out = subprocess.run([OSASCRIPT] + self.SCRIPT + [title, text], stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.PIPE, timeout=NOTIFY_TIMEOUT_S)
+            res["ok"] = out.returncode == 0
+            if not res["ok"]:
+                res["error"] = (out.stderr.decode("utf-8", "replace").strip() or "osascript exit %d" % out.returncode)[:200]
+        except subprocess.TimeoutExpired:
+            res["error"] = "osascript did not finish within %d s" % NOTIFY_TIMEOUT_S
+        except OSError as e:
+            res["error"] = str(e)[:200]
+        with self.lock:
+            self.last = res
+        if not res["ok"]:
+            sys.stderr.write("notification failed: %s\n" % res["error"])
+        return res
+
+    def run(self):
+        while True:
+            title, body = self.q.get()
+            self.post("mac-monitor: " + title, body)
+
+
+# ----------------------------------------------------------------------------
 # On-demand speed test (networkQuality ships with macOS). Never runs by itself:
 # it moves a couple of hundred MB and disturbs the line while it runs.
 # ----------------------------------------------------------------------------
@@ -1485,9 +1620,16 @@ class Handler(BaseHTTPRequestHandler):
         # header cannot be sent cross-site without a preflight this server never grants
         u = urlparse(self.path)
         try:
-            self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536))
+            raw = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536))
             if self.headers.get("X-Mac-Monitor") != "1":
                 return self._json({"error": "missing X-Mac-Monitor header"}, 403)
+            if u.path == "/api/notifications":
+                body = json.loads(raw.decode("utf-8") or "{}")
+                nt, action = self.sampler.notifier, body.get("action")
+                if action == "test":      # explicit, so it posts even while muted
+                    res = nt.post("mac-monitor: test notification", "Notifications from mac-monitor look like this.")
+                    return self._json(dict(nt.status(), test=res))
+                return self._json(nt.set_mute(action, body.get("seconds", 3600)))
             if u.path == "/api/speedtest":
                 return self._json(self.speedtest.start())
             return self._json({"error": "not found"}, 404)
@@ -1556,6 +1698,7 @@ class Handler(BaseHTTPRequestHandler):
         with sm.net.lock:
             net = sm.net.latest
         out["internet"] = net and {k: v for k, v in net.items() if k != "http_new"}
+        out["notifications"] = sm.notifier.status() if sm.notifier else None
         n = sm.collector.ncpu
         out["limits"] = {"load_warn": n * LOAD_WARN_X_NCPU, "load_critical": n * LOAD_CRITICAL_X_NCPU,
                          "load_clear": n * LOAD_CLEAR_X_NCPU, "load_sustain_s": LOAD_SUSTAIN_S}
@@ -1588,6 +1731,8 @@ def serve():
         raise SystemExit("cannot listen on 127.0.0.1:%d (%s)" % (port, e))
     httpd.daemon_threads = True
     sampler = Sampler()
+    sampler.notifier = Notifier("http://127.0.0.1:%d/" % port)
+    sampler.notifier.start()
     Handler.sampler = sampler
     Handler.speedtest = SpeedTest()
     sampler.start()
@@ -1748,6 +1893,13 @@ def snapshot():
             P("  Last speed test %s: %.1f Mbps down, %.1f Mbps up" % (fmt_ts(st["ts"]), st["down_mbps"], st["up_mbps"]))
     P("")
     evs = con.execute("SELECT * FROM events ORDER BY ts DESC LIMIT 15").fetchall()
+    mute = meta_get("notify_mute") or {}
+    P("NOTIFICATIONS  " + (
+        "disabled in monitor.py (NOTIFY_ENABLED)" if not NOTIFY_ENABLED
+        else "off, switched off in the dashboard" if mute.get("off")
+        else "muted until %s" % fmt_ts(mute["until"]) if mute.get("until", 0) > time.time()
+        else "on: a macOS banner (shown under Script Editor) when an event opens"))
+    P("")
     P("RECENT EVENTS (%d shown, 7 days kept)" % len(evs))
     if not evs:
         P("  none recorded")
