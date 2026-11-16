@@ -940,35 +940,33 @@ def store_net(con, r):
 
 
 def net_summary(con, start, end):
-    """Uptime, outages and latency over a window, from the raw probe rows."""
-    rows = con.execute("SELECT ts, state, lat_ms, loss FROM net WHERE ts > ? AND ts <= ? ORDER BY ts",
-                       (start, end)).fetchall()
-    if not rows:
+    """Uptime, outages and latency over a window, from the raw probe rows.
+    Aggregated in SQL so a 7-day window stays cheap."""
+    n, down_rows, worst, loss, lat_n = con.execute(
+        "SELECT COUNT(*), SUM(state != 'up'), MAX(lat_ms), AVG(CASE WHEN state = 'up' THEN loss END),"
+        " COUNT(lat_ms) FROM net WHERE ts > ? AND ts <= ?", (start, end)).fetchone()
+    if not n:
         return None
-    gap = NET_PROBE_INTERVAL_S * 3
-    outages, run_start, prev_ts, down_rows = [], None, None, 0
-    for r in rows:
-        down = r["state"] != "up"
-        if run_start is not None and (not down or r["ts"] - prev_ts > gap):
-            outages.append((run_start, prev_ts + NET_PROBE_INTERVAL_S))
-            run_start = None
-        if down:
-            down_rows += 1
-            if run_start is None:
-                run_start = r["ts"]
-        prev_ts = r["ts"]
-    if run_start is not None:
-        outages.append((run_start, prev_ts + NET_PROBE_INTERVAL_S))
-    lats = [r["lat_ms"] for r in rows if r["lat_ms"] is not None]
-    up_loss = [r["loss"] for r in rows if r["state"] == "up"]
-    med = median(lats)
-    return {"probes": len(rows), "uptime_pct": round(100.0 * (len(rows) - down_rows) / len(rows), 2),
-            "outages": len(outages), "outage_s": sum(e - s for s, e in outages),
-            "longest_outage_s": max([e - s for s, e in outages] or [0]),
+    med = None
+    if lat_n:
+        med = con.execute("SELECT lat_ms FROM net WHERE ts > ? AND ts <= ? AND lat_ms IS NOT NULL"
+                          " ORDER BY lat_ms LIMIT 1 OFFSET ?", (start, end, lat_n // 2)).fetchone()[0]
+    gap = NET_PROBE_INTERVAL_S * 1.5      # down rounds further apart than this are separate outages
+    outages = []
+    for (ts,) in con.execute("SELECT ts FROM net WHERE ts > ? AND ts <= ? AND state != 'up' ORDER BY ts",
+                             (start, end)):
+        if outages and ts - outages[-1][1] <= gap:
+            outages[-1][1] = ts
+        else:
+            outages.append([ts, ts])
+    lengths = [e - s + NET_PROBE_INTERVAL_S for s, e in outages]
+    return {"probes": n, "uptime_pct": round(100.0 * (n - (down_rows or 0)) / n, 2),
+            "outages": len(outages), "outage_s": sum(lengths),
+            "longest_outage_s": max(lengths or [0]),
             "last_outage": outages[-1][0] if outages else None,
             "latency_median_ms": round(med, 1) if med is not None else None,
-            "latency_worst_ms": round(max(lats), 1) if lats else None,
-            "loss_pct": round(sum(up_loss) / len(up_loss), 2) if up_loss else None}
+            "latency_worst_ms": round(worst, 1) if worst is not None else None,
+            "loss_pct": round(loss, 2) if loss is not None else None}
 
 
 # ----------------------------------------------------------------------------

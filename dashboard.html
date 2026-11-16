@@ -751,7 +751,10 @@ async function tick() {
     $("connText").textContent = "Monitor not responding" + (lastOk ? " since " + fmtClock(lastOk / 1000, true) : "") + " · retrying";
   }
   ticks++;
-  if (ticks % 2 === 0) { loadEvents(); if (state.end == null && !state.histLoading && !state.hover) loadHistory(false); }
+  if (ticks % 2 === 0) loadEvents();
+  // refresh the charts no more often than their buckets change (10 s to 60 s)
+  const every = Math.max(2, Math.min(12, Math.round((state.hist ? state.hist.bucket : 10) / 5)));
+  if (ticks % every === 0 && state.end == null && !state.histLoading && !state.hover) loadHistory(false);
 }
 renderView(); renderProcs();
 loadHistory(true); loadEvents(); pollSpeed(); tick(); setInterval(tick, 5000);
