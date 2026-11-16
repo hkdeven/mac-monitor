@@ -41,14 +41,15 @@ An event row is written, with the process lists at that moment, when:
 
 | Event | Condition |
 |---|---|
-| CPU high | total CPU above 85% for 30 s |
+| Load above core count | 1-minute load average above the core count for 60 s (warning); raised to critical once it has stayed above 2x the core count for 60 s. Closes when load falls below 0.9x the core count |
 | Memory pressure | kernel pressure level warn or critical |
 | Swap growing | swap used up 256 MB within 60 s |
 | Disk low | a volume under 10% free |
 | CPU throttled | `CPU_Speed_Limit` below 100 |
 
 One event covers the whole incident: it closes when the condition has been
-clear for 60 s. The thresholds are constants at the top of `monitor.py`.
+clear for 60 s (the load event instead closes as soon as load is under its
+lower line). High CPU % on its own is not an event. The thresholds are constants at the top of `monitor.py`.
 
 ## JSON
 

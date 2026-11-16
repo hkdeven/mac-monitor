@@ -28,8 +28,10 @@ from urllib.parse import parse_qs, urlparse
 # ----------------------------------------------------------------------------
 # Tunables. Event thresholds live here.
 # ----------------------------------------------------------------------------
-CPU_HIGH_PCT = 85.0            # total CPU busy % that counts as "high"
-CPU_HIGH_SUSTAIN_S = 30        # ...and for how long before an event is recorded
+LOAD_WARN_X_NCPU = 1.0         # 1-minute load above this many times the core count: warning
+LOAD_CRITICAL_X_NCPU = 2.0     # ...above this many times the core count: critical
+LOAD_SUSTAIN_S = 60            # ...once it has stayed above the line this long
+LOAD_CLEAR_X_NCPU = 0.9        # the load event closes when load falls below this (hysteresis)
 MEM_PRESSURE_WARN_LEVEL = 2    # kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
 MEM_PRESSURE_CRITICAL_LEVEL = 4
 SWAP_GROWTH_MB = 256           # swap used grew by at least this much...
@@ -307,6 +309,7 @@ class Collector:
         self.prev = None          # previous raw counters
         self.prev_proc = {}       # pid -> cpu seconds
         self.names = {}           # pid -> (short name, full name)
+        self.last_top = None      # (top_cpu, top_mem, top_groups, nproc) of the last good ps
         self.slow = {"volumes": [], "thermal": parse_therm("")}
         self.slow_at = 0
 
@@ -396,6 +399,9 @@ class Collector:
         self._slow(now)
 
         # ---- processes -----------------------------------------------------
+        if not raw["ps"] and self.last_top:
+            # ps timed out (machine badly overloaded): keep the last lists rather than none
+            raw["ps_failed"] = True
         procs = []
         groups = {}               # name -> [count, cpu, rss_kb, busiest pid, its cpu]
         cur_proc = {}
@@ -412,7 +418,8 @@ class Collector:
             grp[2] += rss_kb
             if cpu > grp[4]:
                 grp[3], grp[4] = pid, cpu
-        self.prev_proc = cur_proc
+        if not raw.get("ps_failed"):
+            self.prev_proc = cur_proc
         if len(self.names) > 400:
             self.names = {p: v for p, v in self.names.items() if p in cur_proc}
         # same-named processes added together (30 node workers at 40% each never
@@ -439,6 +446,12 @@ class Collector:
             fn = full[groups[nm][3]]
             return fn if groups[nm][0] == 1 and fn.startswith(nm) else nm + "\u2026"
         top_groups = [(group_name(g[0]),) + g[1:] for g in top_groups]
+
+        nproc = len(procs)
+        if raw.get("ps_failed"):
+            top_cpu, top_mem, top_groups, nproc = self.last_top
+        else:
+            self.last_top = (top_cpu, top_mem, top_groups, nproc)
 
         # ---- cpu -------------------------------------------------------------
         per_core = []
@@ -513,7 +526,8 @@ class Collector:
             "net": {"in_bps": round(net_in), "out_bps": round(net_out), "ifaces": ifaces},
             "thermal": self.slow["thermal"],
             "uptime_s": int(now - self.boot),
-            "nproc": len(procs),
+            "nproc": nproc,
+            "ps_stale": bool(raw.get("ps_failed")),
             "top": {"cpu": top_cpu, "mem": top_mem, "groups": top_groups},
         }
 
@@ -617,6 +631,9 @@ class EventEngine:
         self.pending = {}   # key -> ts the condition first held
         self.active = {}    # key -> {"id", "peak", "clear_since", "higher"}
         self.swap_hist = deque()
+        self.load_since = None        # ts the load first went above the warning line
+        self.load_crit_since = None   # ts the load first went above the critical line
+        self.load_event = None        # {"id", "peak", "critical"} while a load event is open
         # anything left open by a previous run ended when that run did
         last = con.execute("SELECT MAX(ts) FROM samples").fetchone()[0]
         con.execute("UPDATE events SET end_ts = COALESCE(?, ts) WHERE end_ts IS NULL", (last,))
@@ -625,9 +642,6 @@ class EventEngine:
     def conditions(self, s):
         """[(key, holds, sustain_s, kind, severity, title, value, unit, higher_is_worse)]"""
         out = []
-        busy = s["cpu"]["busy"]
-        out.append(("cpu_high", busy > CPU_HIGH_PCT, CPU_HIGH_SUSTAIN_S, "cpu_high", "warning",
-                    "CPU above %d%% for %ds" % (CPU_HIGH_PCT, CPU_HIGH_SUSTAIN_S), busy, "%", True))
         level = s["mem"]["pressure_level"]
         out.append(("mem_warn", level >= MEM_PRESSURE_WARN_LEVEL, 0, "mem_pressure", "warning",
                     "Memory pressure: warn", level, "level", True))
@@ -650,9 +664,50 @@ class EventEngine:
                     "warning", "CPU speed limited to %s%%" % limit, limit or 0, "%", False))
         return out
 
+    def feed_load(self, s):
+        """Load above core count: more runnable work than cores. High CPU % alone
+        is not an event. Opens as a warning after LOAD_SUSTAIN_S above the core
+        count, is raised to critical after LOAD_SUSTAIN_S above the critical
+        line, and closes as soon as load is back under the clear line (the gap
+        between the two lines is what stops it flapping)."""
+        now, n, load = s["ts"], s["cpu"]["ncpu"], s["cpu"]["load"][0]
+        warn, crit, clear = n * LOAD_WARN_X_NCPU, n * LOAD_CRITICAL_X_NCPU, n * LOAD_CLEAR_X_NCPU
+        j = lambda o: json.dumps(o, separators=(",", ":"))
+        self.load_crit_since = (self.load_crit_since or now) if load > crit else None
+        act = self.load_event
+        if act is None:
+            if load <= warn:
+                self.load_since = None
+                return
+            self.load_since = self.load_since or now
+            if now - self.load_since < LOAD_SUSTAIN_S:
+                return
+            cur = self.con.execute(
+                "INSERT INTO events (ts,end_ts,kind,severity,title,value,peak,unit,by_cpu,by_mem,by_name) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (now, None, "load_high", "warning",
+                 "Load above %g cores for %ds" % (warn, LOAD_SUSTAIN_S), load, load, "load",
+                 j(s["top"]["cpu"]), j(s["top"]["mem"]), j(s["top"]["groups"])))
+            act = self.load_event = {"id": cur.lastrowid, "peak": load, "critical": False}
+        elif load < clear:
+            self.con.execute("UPDATE events SET end_ts=? WHERE id=?", (now, act["id"]))
+            self.load_event = self.load_since = None
+            return
+        elif load > act["peak"]:
+            act["peak"] = load
+            self.con.execute("UPDATE events SET peak=? WHERE id=?", (load, act["id"]))
+        if (not act["critical"] and self.load_crit_since is not None
+                and now - self.load_crit_since >= LOAD_SUSTAIN_S):
+            act["critical"] = True
+            self.con.execute(
+                "UPDATE events SET severity='critical', title=? WHERE id=?",
+                ("Load above %g (%gx %d cores) for %ds" % (crit, LOAD_CRITICAL_X_NCPU, n, LOAD_SUSTAIN_S),
+                 act["id"]))
+
     def feed(self, s):
         now = s["ts"]
         j = lambda o: json.dumps(o, separators=(",", ":"))
+        self.feed_load(s)
         for key, holds, sustain, kind, sev, title, value, unit, higher in self.conditions(s):
             act = self.active.get(key)
             if act:
@@ -764,12 +819,12 @@ def query_history(con, rng, end=None):
     rows = con.execute(
         "SELECT (ts/?)*? AS t, AVG(cpu_user), AVG(cpu_sys), MAX(cpu_user+cpu_sys), AVG(load1),"
         " AVG(mem_app), AVG(mem_wired), AVG(mem_compressed), AVG(swap_used), MAX(pressure),"
-        " AVG(disk_read), AVG(disk_write), AVG(net_in), AVG(net_out), COUNT(*)"
+        " AVG(disk_read), AVG(disk_write), AVG(net_in), AVG(net_out), COUNT(*), MAX(load1)"
         " FROM samples WHERE ts > ? AND ts <= ? GROUP BY ts/? ORDER BY t",
         (bucket, bucket, start, end, bucket)).fetchall()
     names = ["t", "cpu_user", "cpu_sys", "cpu_peak", "load1", "mem_app", "mem_wired",
              "mem_compressed", "swap_used", "pressure", "disk_read", "disk_write",
-             "net_in", "net_out", "n"]
+             "net_in", "net_out", "n", "load_peak"]
     cols = {n: [] for n in names}
     for r in rows:
         for i, n in enumerate(names):
@@ -896,6 +951,9 @@ class Handler(BaseHTTPRequestHandler):
             out["active_events"] = [event_dict(r, with_procs=False) for r in rows]
         finally:
             con.close()
+        n = sm.collector.ncpu
+        out["limits"] = {"load_warn": n * LOAD_WARN_X_NCPU, "load_critical": n * LOAD_CRITICAL_X_NCPU,
+                         "load_clear": n * LOAD_CLEAR_X_NCPU, "load_sustain_s": LOAD_SUSTAIN_S}
         out["sampler"] = {"interval_s": SAMPLE_INTERVAL_S, "overhead_pct_of_one_core": sm.overhead_pct(),
                           "samples_this_run": sm.samples_taken, "running_s": int(time.time() - sm.started),
                           "native_readers": sm.collector.native is not None}
@@ -974,8 +1032,13 @@ def snapshot():
     P("")
     P("NOW (2s sample)")
     cpu, mem, sw = s["cpu"], s["mem"], s["swap"]
-    P("  CPU       %5.1f%% busy  (user %.1f%%, system %.1f%%, idle %.1f%%)   load %.2f %.2f %.2f" % (
-        cpu["busy"], cpu["user"], cpu["sys"], cpu["idle"], *cpu["load"]))
+    P("  CPU       %5.1f%% busy  (user %.1f%%, system %.1f%%, idle %.1f%%)" % (
+        cpu["busy"], cpu["user"], cpu["sys"], cpu["idle"]))
+    l1 = cpu["load"][0]
+    state = ("CRITICAL, above %gx cores" % LOAD_CRITICAL_X_NCPU if l1 > c.ncpu * LOAD_CRITICAL_X_NCPU
+             else "WARNING, above core count" if l1 > c.ncpu * LOAD_WARN_X_NCPU else "ok")
+    P("  Load      %.2f of %d cores  (1 min; 5 min %.2f, 15 min %.2f)   %s" % (
+        l1, c.ncpu, cpu["load"][1], cpu["load"][2], state))
     if cpu["per_core"]:
         P("  Per core  " + " ".join("%3.0f" % x for x in cpu["per_core"]))
     P("  Memory    %s used of %s  (app %s, wired %s, compressed %s, cached %s, free %s)" % (
@@ -1029,7 +1092,7 @@ def snapshot():
         top = query_processes(con, cpu_ts)["by_name"][:3]
         if top:
             P("    top then:     " + ", ".join("%s x%d %.0f%%" % (p["name"], p["count"], p["cpu"]) for p in top))
-        P("  Load peak       " + peak("load1", lambda v: "%.2f" % v)[0])
+        P("  Load peak       " + peak("load1", lambda v: "%.2f of %d cores" % (v, c.ncpu))[0])
         P("  Memory peak     %s   (average %s)" % (peak("mem_used", fmt_bytes)[0], fmt_bytes(avg[1])))
         P("  Compressed peak " + peak("mem_compressed", fmt_bytes)[0])
         P("  Swap peak       " + peak("swap_used", fmt_bytes)[0])

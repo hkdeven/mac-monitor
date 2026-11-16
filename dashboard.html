@@ -93,6 +93,7 @@ canvas, tbody { transition: opacity .15s; }
 
 /* charts */
 .charts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+.charts > :last-child:nth-child(odd) { grid-column: 1 / -1; }
 .chart { padding: 11px 12px 8px; }
 .chead { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
 .chead .hint { font-weight: 400; color: var(--muted); font-size: 12px; margin-left: 6px; }
@@ -185,6 +186,7 @@ footer a { color: var(--text-2); }
 
   <section class="charts" id="charts">
     <div class="card chart pick" id="cCpu"><div class="chead"><h2>CPU<span class="hint">click a point for its processes</span></h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
+    <div class="card chart pick" id="cLoad"><div class="chead"><h2>Load<span class="hint">runnable work against cores</span></h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
     <div class="card chart pick" id="cMem"><div class="chead"><h2>Memory</h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
     <div class="card chart pick" id="cDisk"><div class="chead"><h2>Disk IO</h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
     <div class="card chart pick" id="cNet"><div class="chead"><h2>Network</h2><div class="legend"></div></div><div class="plot"><canvas></canvas><div class="tip"></div><div class="empty"></div></div></div>
@@ -202,7 +204,7 @@ footer a { color: var(--text-2); }
     <div class="card panel" id="evPanel">
       <div class="phead"><h2>Events</h2><span class="sub" style="color:var(--muted);font-size:12px" id="evCount"></span></div>
       <div class="evlist" id="evList"></div>
-      <div class="none" id="evNone" hidden>No events recorded. One appears when CPU stays high, memory pressure rises, swap grows, a disk runs low or the CPU is throttled.</div>
+      <div class="none" id="evNone" hidden>No events recorded. One appears when load stays above the core count, memory pressure rises, swap grows, a disk runs low or the CPU is throttled.</div>
     </div>
   </section>
 
@@ -336,6 +338,13 @@ class Chart {
       c.strokeStyle = col("--grid"); c.beginPath(); c.moveTo(g.l, y); c.lineTo(g.w - g.r, y); c.stroke();
       c.fillStyle = col("--muted"); c.fillText(cfg.fmtAxis(ymax * f), g.l - 6, y);
     }
+    // reference lines (the core count on the load chart), labelled on the line
+    for (const ref of (cfg.refs ? cfg.refs() : [])) {
+      if (!(ref.v > 0) || ref.v > ymax) continue;
+      const y = Math.round(yOf(ref.v)) + .5;
+      c.strokeStyle = col("--text-2"); c.setLineDash([5, 4]); c.beginPath(); c.moveTo(g.l, y); c.lineTo(g.w - g.r, y); c.stroke(); c.setLineDash([]);
+      c.textAlign = "right"; c.textBaseline = "bottom"; c.fillStyle = col("--text-2"); c.fillText(ref.label, g.w - g.r - 2, y - 3);
+    }
     // x labels
     const span = hist.end - hist.start, maxTicks = Math.max(2, Math.floor(pw / 80));
     const step = X_STEPS.find(s => span / s <= maxTicks) || 172800;
@@ -406,6 +415,7 @@ class Chart {
   }
 }
 
+const ncpu = () => (state.now && state.now.host ? state.now.host.ncpu : 0);
 const charts = [
   new Chart("cCpu", {
     series: [{key: "cpu_user", label: "User", color: "--s1", type: "area"}, {key: "cpu_sys", label: "System", color: "--s2", type: "area"},
@@ -415,6 +425,13 @@ const charts = [
       {label: "User", color: "--s1", value: S.cpu_user[i].toFixed(1) + "%"}, {label: "System", color: "--s2", value: S.cpu_sys[i].toFixed(1) + "%"},
       {label: "Total", value: (S.cpu_user[i] + S.cpu_sys[i]).toFixed(1) + "%"}, {label: "Peak", color: "--text-2", line: true, value: S.cpu_peak[i].toFixed(1) + "%"},
       {label: "Load (1m)", value: S.load1[i].toFixed(2)}],
+  }),
+  new Chart("cLoad", {
+    series: [{key: "load1", label: "Load (1 min)", color: "--s1", type: "line"}, {key: "load_peak", label: "Peak in interval", color: "--text-2", type: "line", thin: true}],
+    refs: () => { const n = ncpu(); return n ? [{v: n, label: n + " cores"}] : []; },
+    yMax: v => niceCeil(Math.max(v, ncpu() * 1.25), 1000), fmtAxis: v => v.toFixed(Number.isInteger(v) ? 0 : 1),
+    tipRows: (S, i) => [{label: "Load", color: "--s1", line: true, value: S.load1[i].toFixed(2)}, {label: "Peak", color: "--text-2", line: true, value: S.load_peak[i].toFixed(2)},
+      {label: "Cores", value: String(ncpu() || "-")}, {label: "Per core", value: ncpu() ? (S.load1[i] / ncpu()).toFixed(2) : "-"}],
   }),
   new Chart("cMem", {
     series: [{key: "mem_app", label: "App", color: "--s1", type: "area"}, {key: "mem_wired", label: "Wired", color: "--s2", type: "area"},
@@ -534,7 +551,8 @@ function renderEvents() {
     b.setAttribute("aria-pressed", String(ev.id === state.selEvent));
     b.appendChild(badge(ev.severity === "critical" ? "critical" : "warning", ev.severity === "critical" ? "Critical" : "Warning"));
     b.appendChild(el("span", "t", ev.title));
-    const peak = ev.unit === "level" ? "" : " · peak " + (+ev.peak).toFixed(ev.unit === "MB" ? 0 : 1) + (ev.unit === "%" ? "%" : " " + ev.unit);
+    const peak = ev.unit === "level" ? "" : ev.unit === "load" ? " · peak load " + (+ev.peak).toFixed(1)
+      : " · peak " + (+ev.peak).toFixed(ev.unit === "MB" ? 0 : 1) + (ev.unit === "%" ? "%" : " " + ev.unit);
     b.appendChild(el("span", "m num", fmtWhen(ev.ts, true) + " · " + (ev.active ? "ongoing for " + fmtDur(Date.now() / 1000 - ev.ts) : "lasted " + fmtDur(ev.end_ts - ev.ts)) + peak));
     b.addEventListener("click", () => selectEvent(ev));
     list.appendChild(b);
@@ -558,8 +576,11 @@ function renderNow() {
   const h = s.host;
   if (!s.ready) { $("hostline").textContent = h.name + " · " + h.model; return; }
   $("hostline").textContent = [h.name, h.model, h.ncpu + " cores", fmtBytes(h.mem_total, 0) + " RAM", "up " + fmtDur(s.uptime_s), s.nproc + " processes"].join(" · ");
-  $("tCpu").textContent = fmtPct(s.cpu.busy);
-  $("tCpuSub").textContent = "user " + s.cpu.user.toFixed(0) + "% · sys " + s.cpu.sys.toFixed(0) + "% · load " + s.cpu.load[0].toFixed(1);
+  const tc = $("tCpu"), l1 = s.cpu.load[0], lim = s.limits || {};
+  tc.textContent = fmtPct(s.cpu.busy) + " ";
+  if (l1 > lim.load_critical) tc.appendChild(badge("critical", "Load critical"));
+  else if (l1 > lim.load_warn) tc.appendChild(badge("warning", "Load high"));
+  $("tCpuSub").textContent = "load " + l1.toFixed(1) + " of " + s.cpu.ncpu + " cores · user " + s.cpu.user.toFixed(0) + "% · sys " + s.cpu.sys.toFixed(0) + "%";
   const cores = $("cores");
   if (cores.children.length !== s.cpu.per_core.length) { cores.textContent = ""; s.cpu.per_core.forEach(() => { const sp = el("span"); sp.appendChild(el("b")); cores.appendChild(sp); }); }
   s.cpu.per_core.forEach((v, i) => { cores.children[i].firstChild.style.height = v + "%"; cores.children[i].title = "Core " + i + ": " + v.toFixed(0) + "%"; });
@@ -590,7 +611,7 @@ async function tick() {
     state.now = await getJSON("/api/now"); lastOk = Date.now();
     const c = $("conn"); c.classList.remove("stale", "tick"); void c.offsetWidth; c.classList.add("tick");
     $("connText").textContent = state.now.ready ? "Live · updated " + fmtClock(state.now.ts, true) : "Waiting for first sample…";
-    renderNow(); if (!state.pin) renderProcs();
+    renderNow(); if (!state.pin) renderProcs(); if (!state.hover) drawAll();
   } catch (e) {
     $("conn").classList.add("stale");
     $("connText").textContent = "Monitor not responding" + (lastOk ? " since " + fmtClock(lastOk / 1000, true) : "") + " · retrying";
