@@ -33,7 +33,7 @@ Every 5 seconds, into `data/monitor.db` (SQLite, gitignored, pruned to 7 days):
 - Disk read / write throughput, network bytes in / out per interface
 - Every 30 seconds: free space per volume, `pmset -g therm`
 
-A week of history is roughly 150-250 MB.
+A week of history is roughly 200 MB.
 
 ## Events
 

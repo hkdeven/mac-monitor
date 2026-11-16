@@ -582,13 +582,15 @@ def open_db(readonly=False):
 def store_sample(con, s):
     j = lambda o: json.dumps(o, separators=(",", ":"))
     c, m, sw, d, n = s["cpu"], s["mem"], s["swap"], s["disk"], s["net"]
+    # idle interfaces and pmset's fixed notes would only pad every row
+    busy_ifaces = {k: v for k, v in n["ifaces"].items() if v["in_bps"] or v["out_bps"]}
     con.execute(
         "INSERT OR REPLACE INTO samples VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (s["ts"], c["user"], c["sys"], c["idle"], c["load"][0], c["load"][1], c["load"][2],
          j(c["per_core"]), m["used"], m["app"], m["wired"], m["compressed"], m["cached"],
          m["free"], m["pressure_level"], sw["used"], sw["total"], sw["in_bps"], sw["out_bps"],
          d["read_bps"], d["write_bps"], j(d["volumes"]), n["in_bps"], n["out_bps"],
-         j(n["ifaces"]), s["thermal"]["speed_limit"], j(s["thermal"]), s["uptime_s"], s["nproc"]))
+         j(busy_ifaces), s["thermal"]["speed_limit"], j(s["thermal"]["values"]), s["uptime_s"], s["nproc"]))
     con.execute("INSERT OR REPLACE INTO procs VALUES (?,?,?,?)",
                 (s["ts"], j(s["top"]["cpu"]), j(s["top"]["mem"]), j(s["top"]["groups"])))
 
