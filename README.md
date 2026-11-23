@@ -25,7 +25,7 @@ Just want a quick look, with no server at all?
 
 ## ✨ What you get
 
-- 📊 A live dashboard with charts for 15 minutes, 1 hour, 6 hours, 24 hours or 7 days
+- 📊 A live dashboard with charts for 15 minutes, 1 hour, 6 hours, 24 hours, 7 days, 30 days, 1 year or everything recorded
 - 🕵️ The top processes at any moment in the past week, so you can see who was hogging the CPU
 - 🌐 An internet verdict in plain words, which says which side of the router the break is on
 - 🔔 A macOS banner when something goes wrong
@@ -119,7 +119,7 @@ targets are constants at the top of `monitor.py` (`NET_TARGETS`, `NET_DNS_NAME`,
 
 ## 📼 What is recorded
 
-Every 5 seconds, into `data/monitor.db` (SQLite, gitignored, pruned to 7 days):
+Every 5 seconds, into `data/monitor.db` (SQLite, gitignored, kept forever; set `RETENTION_DAYS` in `monitor.py` to prune, about 20 MB a day):
 
 - 🧠 CPU: user / system / idle, per core, load averages
 - 🏆 Top 10 processes by CPU and top 10 by memory (name, pid, cpu %, rss), plus
@@ -203,7 +203,7 @@ Everything the dashboard shows is also available as JSON:
 
 ```text
 /api/now                         latest sample, live process lists, open events
-/api/history?range=1h            15m | 1h | 6h | 24h | 7d, downsampled to ~360 points or fewer
+/api/history?range=1h            15m | 1h | 6h | 24h | 7d | 30d | 1y | all, downsampled to ~360 points or fewer
 /api/history?range=1h&end=TS     the window ending at a unix time
 /api/events?limit=100&since=TS   events, newest first, with their process lists
 /api/speedtest                   speed test state and last result (POST with header X-Mac-Monitor: 1 starts one)
@@ -233,7 +233,7 @@ bucket. `/api/processes` with no `at` returns the newest lists. For "mute",
 | Network | `netstat -ibn` |
 | Internet | `/sbin/ping`, `route -n get default`, a UDP DNS query to the servers in `/etc/resolv.conf`, CoreWLAN via ctypes |
 | Volumes | `df -k` (`/` and anything under `/Volumes`) |
-| Thermal | `pmset -g therm` |
+| Thermal | `NSProcessInfo.thermalState` via ctypes (nominal, fair, serious, critical); `pmset -g therm` for the CPU speed limit on Intel |
 
 Notes:
 
@@ -243,7 +243,8 @@ Notes:
 - 🧮 "Used" memory is app + wired + compressed, as in Activity Monitor. Cached
   files are reported separately and are not counted as used.
 - 🌡️ On Apple Silicon `pmset -g therm` usually reports no CPU speed limit at
-  all. The dashboard then shows "Not reported" and no throttle event can fire.
+  all, so the Thermal tile shows the macOS thermal state instead. A throttle
+  event opens when that state reaches serious or critical.
 - 🚫 Per-process disk and network use, temperatures and fan speeds need sudo
   (`powermetrics`, `fs_usage`, `nettop` in part) and are not collected.
 
