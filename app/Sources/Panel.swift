@@ -15,13 +15,14 @@ enum Level {
 
     /// Colour of a status word written as text. On a light panel the system
     /// green, orange and red are too pale to read as text, so there they are
-    /// mixed with black; on a dark panel they are used as they are.
+    /// mixed half and half with black (each is then 4.9:1 or better on a tile); on a dark panel
+    /// they are used as they are.
     var textColor: NSColor {
         if self == .unknown { return .secondaryLabelColor }
         let base = color
         return NSColor(name: nil) { look in
             if look.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua { return base }
-            return base.usingColorSpace(.sRGB)?.blended(withFraction: 0.4, of: .black) ?? base
+            return base.usingColorSpace(.sRGB)?.blended(withFraction: 0.5, of: .black) ?? base
         }
     }
 
@@ -85,10 +86,7 @@ private func detail(_ text: String, lead: String? = nil, level: Level = .unknown
         out.append(NSAttributedString(string: lead, attributes: [.font: font(12, .medium), .foregroundColor: level.textColor]))
         if !rest.isEmpty { rest = ", " + rest }
     }
-    // A line with a coloured word is drawn without the panel's vibrancy, where
-    // the tertiary colour is too faint on a dark backdrop; use secondary there.
-    let quiet: NSColor = lead == nil ? .tertiaryLabelColor : .secondaryLabelColor
-    out.append(NSAttributedString(string: rest, attributes: [.font: font(12), .foregroundColor: quiet]))
+    out.append(NSAttributedString(string: rest, attributes: [.font: font(12), .foregroundColor: NSColor.tertiaryLabelColor]))
     let para = NSMutableParagraphStyle()
     para.lineBreakMode = .byTruncatingTail
     out.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: out.length))
@@ -123,6 +121,30 @@ private class FillView: NSView {
         let plain = effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) ?? .aqua
         NSAppearance(named: plain)?.performAsCurrentDrawingAppearance {
             layer?.backgroundColor = fill.cgColor
+        }
+    }
+}
+
+/// The panel's surface: white on a light Mac, near black on a dark one.
+private let panelColor = NSColor.controlBackgroundColor
+
+/// The panel's root view. It puts one solid colour behind the whole popover,
+/// arrow included, so nothing behind the panel shows through.
+private final class PanelBox: FillView {
+    private let backing = FillView(frame: .zero)
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // The popover's frame view holds its see-through material (arrow
+        // included) and, above that, this view. A plain view slipped between
+        // the two covers the material and is clipped to the popover's shape.
+        guard let frame = window?.contentView?.superview else { return }
+        backing.fill = panelColor
+        backing.frame = frame.bounds
+        backing.autoresizingMask = [.width, .height]
+        if backing.superview !== frame {
+            backing.removeFromSuperview()
+            frame.addSubview(backing, positioned: .below, relativeTo: self)
         }
     }
 }
@@ -342,7 +364,8 @@ final class PanelController: NSViewController {
         root.setCustomSpacing(12, after: events)
         root.setCustomSpacing(10, after: line)
 
-        let box = NSView()
+        let box = PanelBox(frame: .zero)
+        box.fill = panelColor
         box.addSubview(root)
         let bottom = root.bottomAnchor.constraint(equalTo: box.bottomAnchor)
         bottom.priority = NSLayoutConstraint.Priority(749)  // the popover grows a moment after its content does
@@ -361,7 +384,10 @@ final class PanelController: NSViewController {
 
     /// Redraws the panel from the monitor's latest read. Only called while the panel is open.
     func render(_ m: Monitor) {
-        _ = view
+        // A plain light or dark look, following the Mac. The popover's own look
+        // is a see-through one whose text colours are made for blending.
+        let plain = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) ?? .aqua
+        if view.appearance?.name != plain { view.appearance = NSAppearance(named: plain) }
         let s = m.now
         let live = m.phase == .live && s?.ready == true
         openButton.isEnabled = m.dashboardURL != nil
