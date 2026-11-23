@@ -13,6 +13,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     private var timer: Timer?
     private var signals: [DispatchSourceSignal] = []
     private var dots: [NSColor: NSImage] = [:]
+    private var lookWatch: NSKeyValueObservation?
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let args = CommandLine.arguments
@@ -47,6 +48,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             src.setEventHandler { NSApp.terminate(nil) }
             src.resume()
             signals.append(src)
+        }
+
+        // An open panel changes with the Mac's light or dark setting at once.
+        lookWatch = NSApp.observe(\.effectiveAppearance) { [weak self] _, _ in
+            Task { @MainActor in self?.refreshViews() }
         }
 
         refreshViews()

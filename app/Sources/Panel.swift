@@ -133,6 +133,15 @@ private let panelColor = NSColor.controlBackgroundColor
 private final class PanelBox: FillView {
     private let backing = FillView(frame: .zero)
 
+    /// Gives the panel and the colour behind it the same plain light or dark
+    /// look, so the arrow can never be a different colour from the body.
+    func setLook(_ name: NSAppearance.Name) {
+        guard appearance?.name != name else { return }
+        let look = NSAppearance(named: name)
+        appearance = look
+        backing.appearance = look
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         // The popover's frame view holds its see-through material (arrow
@@ -142,10 +151,19 @@ private final class PanelBox: FillView {
         backing.fill = panelColor
         backing.frame = frame.bounds
         backing.autoresizingMask = [.width, .height]
+        // The frame view's child that holds this view: this view itself today.
+        var holder: NSView = self
+        while let up = holder.superview, up !== frame { holder = up }
         if backing.superview !== frame {
             backing.removeFromSuperview()
-            frame.addSubview(backing, positioned: .below, relativeTo: self)
+            frame.addSubview(backing, positioned: .below, relativeTo: holder)
         }
+    }
+
+    override func layout() {
+        super.layout()
+        // Keep covering the whole popover if it is resized without autoresizing.
+        if let frame = backing.superview, backing.frame != frame.bounds { backing.frame = frame.bounds }
     }
 }
 
@@ -387,7 +405,7 @@ final class PanelController: NSViewController {
         // A plain light or dark look, following the Mac. The popover's own look
         // is a see-through one whose text colours are made for blending.
         let plain = NSApp.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) ?? .aqua
-        if view.appearance?.name != plain { view.appearance = NSAppearance(named: plain) }
+        (view as? PanelBox)?.setLook(plain)
         let s = m.now
         let live = m.phase == .live && s?.ready == true
         openButton.isEnabled = m.dashboardURL != nil
