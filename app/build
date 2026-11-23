@@ -1,0 +1,22 @@
+#!/bin/sh
+# Build "Mac Monitor.app" into app/dist/. Needs only swiftc (Command Line Tools).
+# MAC_MONITOR_REPO overrides the folder the app starts monitor.py from
+# (default: the folder this script's parent is in, the repo itself).
+set -eu
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=${MAC_MONITOR_REPO:-$(dirname "$HERE")}
+APP="$HERE/dist/Mac Monitor.app"
+
+if [ ! -f "$REPO/monitor.py" ]; then
+  echo "app/build: no monitor.py in $REPO" >&2
+  exit 1
+fi
+
+rm -rf "$HERE/dist"
+mkdir -p "$APP/Contents/MacOS"
+/usr/bin/swiftc -O -target "$(uname -m)-apple-macos12.0" \
+  -o "$APP/Contents/MacOS/Mac Monitor" "$HERE"/Sources/*.swift
+cp "$HERE/Info.plist" "$APP/Contents/Info.plist"
+/usr/bin/plutil -replace MacMonitorRepoPath -string "$REPO" "$APP/Contents/Info.plist"
+/usr/bin/codesign --force -s - "$APP"
+echo "Built $APP (monitor folder: $REPO)"
