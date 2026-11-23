@@ -4,6 +4,7 @@ import Foundation
 // Anything monitor.py can leave out or send as null is optional here.
 struct Now: Decodable {
     let ready: Bool
+    let ts: Double?     // when the monitor took this reading (unix time)
     let cpu: CPU?
     let mem: Mem?
     let swap: Swap?

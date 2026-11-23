@@ -161,7 +161,7 @@ private final class Tile: FillView {
         addSubview(stack)
 
         let snug = stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8)
-        snug.priority = .defaultLow
+        snug.priority = NSLayoutConstraint.Priority(200)    // below the stack's own hugging
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
@@ -341,9 +341,11 @@ final class PanelController: NSViewController {
 
         let box = NSView()
         box.addSubview(root)
+        let bottom = root.bottomAnchor.constraint(equalTo: box.bottomAnchor)
+        bottom.priority = .defaultHigh      // the popover grows a moment after its content does
         NSLayoutConstraint.activate([
             root.topAnchor.constraint(equalTo: box.topAnchor),
-            root.bottomAnchor.constraint(equalTo: box.bottomAnchor),
+            bottom,
             root.leadingAnchor.constraint(equalTo: box.leadingAnchor),
             root.trailingAnchor.constraint(equalTo: box.trailingAnchor),
             root.widthAnchor.constraint(equalToConstant: panelWidth),
@@ -364,7 +366,7 @@ final class PanelController: NSViewController {
 
         switch m.phase {
         case .live:
-            if live, let t = m.lastGood {
+            if live, let t = s?.ts.map({ Date(timeIntervalSince1970: $0) }) ?? m.lastGood {
                 state.stringValue = "Live, updated \(PanelController.clock.string(from: t))"
             } else {
                 state.stringValue = "Connecting\u{2026}"
@@ -416,12 +418,14 @@ final class PanelController: NSViewController {
         }
         if let d = s.disk, let v = d.volumes.min(by: { $0.free_pct < $1.free_pct }) {
             var free = part(fmtBytes(v.free), of: fmtBytes(v.total))
-            if v.mount != "/" { free += ", " + v.mount }
+            if v.mount != "/" { free = (v.mount as NSString).lastPathComponent + ", " + free }
             let line = v.free_pct < 5 ? detail(free, lead: "Low", level: .critical)
                 : v.free_pct < 10 ? detail(free, lead: "Low", level: .warning) : detail(free)
             let lowest = d.volumes.count > 1 ? " (lowest of \(d.volumes.count) volumes)" : ""
             disk.show(number: String(format: "%.0f%%", v.free_pct), sub: line,
                       tip: "\(part(fmtBytes(v.free), of: fmtBytes(v.total))) free on \(v.mount)\(lowest), reading and writing \(fmtRate(d.read_bps + d.write_bps))")
+        } else {
+            disk.show(number: "-", sub: detail("no reading this time"), tip: "The monitor could not read the disks this time")
         }
         if let n = s.net {
             let active = n.ifaces.filter { !$0.key.hasPrefix("lo") && ($0.value.in_bps > 0 || $0.value.out_bps > 0) }.keys.sorted()
@@ -440,7 +444,7 @@ final class PanelController: NSViewController {
                 therm.show(side: limit < 100 ? String(format: "Throttled %.0f%%", limit) : "Normal",
                            limit < 100 ? .warning : .good, sub: line, tip: line)
             } else {
-                let line = "pmset gives no CPU speed limit on this Mac"
+                let line = "This Mac does not report it"
                 therm.show(side: "Not reported", .unknown, sub: line, tip: line)
             }
         }
@@ -454,20 +458,28 @@ final class PanelController: NSViewController {
         }
         let nowTs = Date().timeIntervalSince1970
         for e in open {
-            let name = makeLabel(12)
-            name.stringValue = e.title
-            name.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-            let age = makeLabel(12, .regular, .tertiaryLabelColor)
-            age.stringValue = "open for \(fmtDur(nowTs - e.ts))"
-            age.setContentCompressionResistancePriority(.required, for: .horizontal)
-            let spare = NSView()
-            spare.setContentHuggingPriority(NSLayoutConstraint.Priority(1), for: .horizontal)
-            let row = NSStackView(views: [makeDot(Level(severity: e.severity).color), name, age, spare])
+            let text = NSMutableAttributedString(string: e.title, attributes: [.font: font(12), .foregroundColor: NSColor.labelColor])
+            text.append(NSAttributedString(string: "  open for \(fmtDur(nowTs - e.ts))",
+                                           attributes: [.font: font(12), .foregroundColor: NSColor.tertiaryLabelColor]))
+            let label = makeLabel(12, wraps: true)
+            label.preferredMaxLayoutWidth = contentWidth - 13
+            label.attributedStringValue = text
+            // The dot sits beside the first line.
+            let dot = makeDot(Level(severity: e.severity).color)
+            let holder = NSView()
+            holder.translatesAutoresizingMaskIntoConstraints = false
+            holder.addSubview(dot)
+            NSLayoutConstraint.activate([
+                holder.widthAnchor.constraint(equalToConstant: 7),
+                holder.heightAnchor.constraint(equalToConstant: 15),
+                dot.centerXAnchor.constraint(equalTo: holder.centerXAnchor),
+                dot.centerYAnchor.constraint(equalTo: holder.centerYAnchor),
+            ])
+            let row = NSStackView(views: [holder, label])
             row.orientation = .horizontal
             row.distribution = .fill
-            row.alignment = .centerY
+            row.alignment = .top
             row.spacing = 6
-            row.toolTip = e.title
             events.addArrangedSubview(row)
             row.widthAnchor.constraint(equalToConstant: contentWidth).isActive = true
         }
@@ -486,6 +498,7 @@ final class PanelController: NSViewController {
         var tips = [i.verdict.text]
         if let avg = i.gateway?.avg { tips.append(String(format: "router %.0f ms", avg)) }
         if i.dns?.ok == true, let ms = i.dns?.ms { tips.append(String(format: "DNS %.0f ms", ms)) }
+        else if i.dns?.ok == false { tips.append("DNS lookup failing") }
         if i.http?.ok == false { tips.append("HTTPS check failing") }
         let tip = tips.joined(separator: ", ")
 
@@ -503,6 +516,12 @@ final class PanelController: NSViewController {
             parts.append(String(format: "%.0f%% loss", loss))
         }
         if let type = i.link?.type { parts.append(type) }
-        inet.show(status: word, level, sub: detail(parts.joined(separator: ", ")), tip: tip)
+        var lead: String?
+        if i.http?.ok == false {
+            lead = "HTTPS check failing"
+        } else if i.dns?.ok == false, !word.hasPrefix("DNS") {
+            lead = "DNS failing"
+        }
+        inet.show(status: word, level, sub: detail(parts.joined(separator: ", "), lead: lead, level: .warning), tip: tip)
     }
 }
