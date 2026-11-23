@@ -85,7 +85,10 @@ private func detail(_ text: String, lead: String? = nil, level: Level = .unknown
         out.append(NSAttributedString(string: lead, attributes: [.font: font(12, .medium), .foregroundColor: level.textColor]))
         if !rest.isEmpty { rest = ", " + rest }
     }
-    out.append(NSAttributedString(string: rest, attributes: [.font: font(12), .foregroundColor: NSColor.tertiaryLabelColor]))
+    // A line with a coloured word is drawn without the panel's vibrancy, where
+    // the tertiary colour is too faint on a dark backdrop; use secondary there.
+    let quiet: NSColor = lead == nil ? .tertiaryLabelColor : .secondaryLabelColor
+    out.append(NSAttributedString(string: rest, attributes: [.font: font(12), .foregroundColor: quiet]))
     let para = NSMutableParagraphStyle()
     para.lineBreakMode = .byTruncatingTail
     out.addAttribute(.paragraphStyle, value: para, range: NSRange(location: 0, length: out.length))
@@ -342,7 +345,7 @@ final class PanelController: NSViewController {
         let box = NSView()
         box.addSubview(root)
         let bottom = root.bottomAnchor.constraint(equalTo: box.bottomAnchor)
-        bottom.priority = .defaultHigh      // the popover grows a moment after its content does
+        bottom.priority = NSLayoutConstraint.Priority(749)  // the popover grows a moment after its content does
         NSLayoutConstraint.activate([
             root.topAnchor.constraint(equalTo: box.topAnchor),
             bottom,
@@ -498,7 +501,7 @@ final class PanelController: NSViewController {
         var tips = [i.verdict.text]
         if let avg = i.gateway?.avg { tips.append(String(format: "router %.0f ms", avg)) }
         if i.dns?.ok == true, let ms = i.dns?.ms { tips.append(String(format: "DNS %.0f ms", ms)) }
-        else if i.dns?.ok == false { tips.append("DNS lookup failing") }
+        else if i.dns?.ok == false, !i.verdict.text.hasPrefix("DNS") { tips.append("last DNS lookup failed") }
         if i.http?.ok == false { tips.append("HTTPS check failing") }
         let tip = tips.joined(separator: ", ")
 
@@ -516,12 +519,7 @@ final class PanelController: NSViewController {
             parts.append(String(format: "%.0f%% loss", loss))
         }
         if let type = i.link?.type { parts.append(type) }
-        var lead: String?
-        if i.http?.ok == false {
-            lead = "HTTPS check failing"
-        } else if i.dns?.ok == false, !word.hasPrefix("DNS") {
-            lead = "DNS failing"
-        }
+        let lead: String? = i.http?.ok == false ? "HTTPS check failing" : nil
         inet.show(status: word, level, sub: detail(parts.joined(separator: ", "), lead: lead, level: .warning), tip: tip)
     }
 }
