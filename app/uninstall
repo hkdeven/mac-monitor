@@ -1,0 +1,14 @@
+#!/bin/sh
+# Quit Mac Monitor.app, stop it opening at login and remove it from
+# ~/Applications. The browser option and the recorded history are not touched.
+set -u
+LABEL=com.hkdeven.mac-monitor-app
+DEST="$HOME/Applications/Mac Monitor.app"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+# A copy opened by hand (not by launchd) is asked to quit too.
+pkill -f "$DEST/Contents/MacOS/Mac Monitor" 2>/dev/null
+rm -f "$PLIST"
+rm -rf "$DEST"
+echo "Removed Mac Monitor.app and its login item."
