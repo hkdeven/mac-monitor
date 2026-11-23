@@ -75,7 +75,7 @@ OSASCRIPT = "/usr/bin/osascript"
 
 SAMPLE_INTERVAL_S = 5          # fast metrics: cpu, memory, processes, disk io, network
 SLOW_INTERVAL_S = 30           # slow metrics: df, pmset -g therm
-RETENTION_DAYS = 7
+RETENTION_DAYS = 0             # 0 keeps everything; a number prunes rows older than that many days
 TOP_N = 10                     # processes kept per sample, by cpu and by memory
 PORT_RANGE = (5180, 5199)      # first free port is used unless MAC_MONITOR_PORT is set
 
@@ -315,7 +315,44 @@ def parse_therm(out):
     for k, v in re.findall(r"^\s*(\w+)\s*=\s*(-?\d+)", out, re.M):
         values[k] = int(v)
     notes = [l.replace("Note:", "").strip() for l in out.splitlines() if l.startswith("Note:")]
-    return {"speed_limit": values.get("CPU_Speed_Limit"), "values": values, "notes": notes}
+    state = thermal_state()
+    if state is not None:
+        values["state"] = state
+    return {"speed_limit": values.get("CPU_Speed_Limit"), "state": state,
+            "state_name": THERMAL_STATES.get(state), "values": values, "notes": notes}
+
+
+THERMAL_STATES = {0: "nominal", 1: "fair", 2: "serious", 3: "critical"}
+THERMAL_STATE_WARN = 2         # NSProcessInfo.thermalState at or above this means macOS is throttling
+_thermal_fn = None
+
+
+def thermal_state():
+    """NSProcessInfo.thermalState via the Objective-C runtime: 0 nominal, 1 fair,
+    2 serious, 3 critical. Works on Apple Silicon, where pmset reports nothing.
+    None when the call is not available."""
+    global _thermal_fn
+    try:
+        if _thermal_fn is None:
+            ctypes.CDLL("/System/Library/Frameworks/Foundation.framework/Foundation")
+            objc = ctypes.CDLL(ctypes.util.find_library("objc"))
+            objc.objc_getClass.restype = ctypes.c_void_p
+            objc.objc_getClass.argtypes = [ctypes.c_char_p]
+            objc.sel_registerName.restype = ctypes.c_void_p
+            objc.sel_registerName.argtypes = [ctypes.c_char_p]
+            proto = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p)
+            proto_long = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p)
+            addr = ctypes.cast(objc.objc_msgSend, ctypes.c_void_p).value
+            info = proto(addr)(objc.objc_getClass(b"NSProcessInfo"),
+                               objc.sel_registerName(b"processInfo"))
+            sel = objc.sel_registerName(b"thermalState")
+            send = proto_long(addr)
+            _thermal_fn = lambda: send(info, sel)
+        state = int(_thermal_fn())
+        return state if state in THERMAL_STATES else None
+    except Exception:
+        _thermal_fn = False
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -1122,6 +1159,10 @@ class EventEngine:
         limit = s["thermal"]["speed_limit"]
         out.append(("throttle", limit is not None and limit < CPU_SPEED_LIMIT_MIN, 0, "cpu_throttle",
                     "warning", "CPU speed limited to %s%%" % limit, limit or 0, "%", False))
+        state = s["thermal"].get("state")
+        out.append(("thermal_state", state is not None and state >= THERMAL_STATE_WARN, 0, "cpu_throttle",
+                    "critical" if state == 3 else "warning",
+                    "Thermal state %s" % s["thermal"].get("state_name"), state or 0, "", True))
         return out
 
     def feed_load(self, s):
@@ -1334,7 +1375,7 @@ class Sampler(threading.Thread):
                 for r in self.net.drain():
                     store_net(con, r)
                     engine.feed_net(r, s["top"])
-                if time.time() - last_prune > 3600:
+                if RETENTION_DAYS > 0 and time.time() - last_prune > 3600:
                     cutoff = int(time.time()) - RETENTION_DAYS * 86400
                     con.execute("DELETE FROM samples WHERE ts < ?", (cutoff,))
                     con.execute("DELETE FROM procs WHERE ts < ?", (cutoff,))
@@ -1824,7 +1865,9 @@ def snapshot():
     else:
         P("    link    %s %s" % (l["type"] or "none", l["iface"] or ""))
     th = s["thermal"]
-    if th["speed_limit"] is None:
+    if th["speed_limit"] is None and th.get("state") is not None:
+        P("  Thermal   %s (macOS thermal state %d of 3)" % (th["state_name"], th["state"]))
+    elif th["speed_limit"] is None:
         P("  Thermal   CPU speed limit not reported by pmset on this machine" +
           ("  [%s]" % "; ".join(th["notes"]) if th["notes"] else ""))
     else:
@@ -1898,7 +1941,7 @@ def snapshot():
         else "muted until %s" % fmt_ts(mute["until"]) if mute.get("until", 0) > time.time()
         else "on: a macOS banner (shown under Script Editor) when an event opens"))
     P("")
-    P("RECENT EVENTS (%d shown, 7 days kept)" % len(evs))
+    P("RECENT EVENTS (%d shown, %s)" % (len(evs), "%d days kept" % RETENTION_DAYS if RETENTION_DAYS > 0 else "all kept"))
     if not evs:
         P("  none recorded")
     for e in evs:

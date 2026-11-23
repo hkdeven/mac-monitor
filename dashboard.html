@@ -666,7 +666,7 @@ async function pickTime(t) {
 // ---------- events ----------
 function renderEvents() {
   const list = $("evList"); list.textContent = "";
-  $("evNone").hidden = state.events.length > 0; $("evCount").textContent = state.events.length ? state.events.length + " in the last 7 days" : "";
+  $("evNone").hidden = state.events.length > 0; $("evCount").textContent = state.events.length ? state.events.length + " most recent" : "";
   for (const ev of state.events) {
     const b = el("button", "ev" + (ev.id === state.selEvent ? " sel" : "")); b.type = "button";
     b.setAttribute("aria-pressed", String(ev.id === state.selEvent));
@@ -721,7 +721,8 @@ function renderNow() {
   const act = Object.entries(s.net.ifaces).filter(([k, x]) => !k.startsWith("lo") && (x.in_bps || x.out_bps)).map(([k]) => k);
   $("tNetSub").textContent = act.length ? act.join(", ") : "idle";
   const th = s.thermal, tt = $("tTherm"); tt.textContent = "";
-  if (th.speed_limit == null) { tt.appendChild(badge("na", "Not reported")); tt.firstChild.style.fontSize = "13.5px"; $("tThermSub").textContent = "pmset gives no CPU speed limit on this Mac"; }
+  if (th.speed_limit == null && th.state != null) { const nm = ["Normal", "Fair", "Serious", "Critical"][th.state] || "Unknown"; tt.appendChild(badge(th.state >= 3 ? "critical" : th.state >= 2 ? "warning" : "good", nm)); tt.firstChild.style.fontSize = "15px"; $("tThermSub").textContent = th.state >= 2 ? "macOS is slowing the Mac to cool it" : th.state === 1 ? "Warm, not slowed" : "Not slowed for heat"; }
+  else if (th.speed_limit == null) { tt.appendChild(badge("na", "Not reported")); tt.firstChild.style.fontSize = "13.5px"; $("tThermSub").textContent = "pmset gives no CPU speed limit on this Mac"; }
   else { tt.appendChild(badge(th.speed_limit < 100 ? "warning" : "good", th.speed_limit < 100 ? "Throttled " + th.speed_limit + "%" : "Normal")); tt.firstChild.style.fontSize = "15px"; $("tThermSub").textContent = "CPU speed limit " + th.speed_limit + "%"; }
   const net = s.internet, ti = $("tInet"), tile = $("tileInet");
   if (net) {

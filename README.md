@@ -119,7 +119,7 @@ targets are constants at the top of `monitor.py` (`NET_TARGETS`, `NET_DNS_NAME`,
 
 ## 📼 What is recorded
 
-Every 5 seconds, into `data/monitor.db` (SQLite, gitignored, pruned to 7 days):
+Every 5 seconds, into `data/monitor.db` (SQLite, gitignored, kept forever; set `RETENTION_DAYS` in `monitor.py` to prune, about 20 MB a day):
 
 - 🧠 CPU: user / system / idle, per core, load averages
 - 🏆 Top 10 processes by CPU and top 10 by memory (name, pid, cpu %, rss), plus
@@ -233,7 +233,7 @@ bucket. `/api/processes` with no `at` returns the newest lists. For "mute",
 | Network | `netstat -ibn` |
 | Internet | `/sbin/ping`, `route -n get default`, a UDP DNS query to the servers in `/etc/resolv.conf`, CoreWLAN via ctypes |
 | Volumes | `df -k` (`/` and anything under `/Volumes`) |
-| Thermal | `pmset -g therm` |
+| Thermal | `NSProcessInfo.thermalState` via ctypes (nominal, fair, serious, critical); `pmset -g therm` for the CPU speed limit on Intel |
 
 Notes:
 
@@ -243,7 +243,8 @@ Notes:
 - 🧮 "Used" memory is app + wired + compressed, as in Activity Monitor. Cached
   files are reported separately and are not counted as used.
 - 🌡️ On Apple Silicon `pmset -g therm` usually reports no CPU speed limit at
-  all. The dashboard then shows "Not reported" and no throttle event can fire.
+  all, so the Thermal tile shows the macOS thermal state instead. A throttle
+  event opens when that state reaches serious or critical.
 - 🚫 Per-process disk and network use, temperatures and fan speeds need sudo
   (`powermetrics`, `fs_usage`, `nettop` in part) and are not collected.
 
