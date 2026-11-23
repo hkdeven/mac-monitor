@@ -23,6 +23,76 @@ Just want a quick look, with no server at all?
 ./snapshot
 ```
 
+Would rather have it in the menu bar? See the Mac app in
+[Two ways to run it](#-two-ways-to-run-it).
+
+## 🚦 Two ways to run it
+
+Pick one, or use both. They share the same monitor and the same history.
+
+### 1. Browser
+
+```bash
+./run
+```
+
+Open the address it prints, normally http://127.0.0.1:5180/. Ctrl-C stops it.
+This is the Quick start above, and nothing about it has changed. The rest of
+this README describes it.
+
+### 2. Mac app
+
+A small menu bar app, "Mac Monitor.app". It shows CPU % and a dot: green when
+all is well, amber while a warning event is open, red while a critical event is
+open or the monitor is not responding. Click it for the same tiles as the top
+row of the dashboard (CPU, Memory pressure, Swap used, Disk free, Network,
+Internet, Thermal), any open events, "Open dashboard" and "Quit". No Dock icon.
+
+Install it:
+
+```bash
+app/install
+```
+
+That builds the app, copies it to `~/Applications/Mac Monitor.app`, starts it,
+and sets it to open at login. It needs `swiftc`, which comes with Apple's
+Command Line Tools (`xcode-select --install`). No Xcode, no sudo.
+
+To build it without installing:
+
+```bash
+app/build
+open "app/dist/Mac Monitor.app"
+```
+
+If you quit it from its panel, open it again with:
+
+```bash
+open ~/Applications/Mac\ Monitor.app
+```
+
+Remove it (the browser option and your history stay as they are):
+
+```bash
+app/uninstall
+```
+
+How the two fit together:
+
+- 🔎 The app looks for a monitor that is already running on 127.0.0.1, ports
+  5180-5199 (or only `MAC_MONITOR_PORT` if you set it). If it finds one, for
+  example your `./run`, it shows that one and never stops it.
+- 🐣 If none answers after 10 seconds, the app starts `python3 monitor.py serve`
+  itself from this folder, and stops it again when you choose Quit. Either way
+  there is one monitor and one `data/monitor.db`.
+- 📁 The app remembers where this folder is from the moment you build it. If
+  you move the folder, run `app/install` again.
+- 🪶 It reads `/api/now` once every 5 seconds and does nothing else. The panel
+  is only redrawn while it is open.
+- 🔑 The login item is one file,
+  `~/Library/LaunchAgents/com.hkdeven.mac-monitor-app.plist`. `app/uninstall`
+  removes it.
+
 ## ✨ What you get
 
 - 📊 A live dashboard with charts for 15 minutes, 1 hour, 6 hours, 24 hours, 7 days, 30 days, 1 year or everything recorded
@@ -42,6 +112,8 @@ Just want a quick look, with no server at all?
 - 🙅 No sudo, ever.
 - ⚡ The speed test button needs `/usr/bin/networkQuality`, which ships with
   macOS 12 and later. Without it, everything else still works.
+- 🧰 The Mac app is optional. Building it needs `swiftc` from Apple's Command
+  Line Tools and macOS 12 or later. The browser option needs neither.
 
 ## 🕹️ Use
 
@@ -76,8 +148,10 @@ Stop that with:
 pkill -f "monitor.py serve"
 ```
 
-It does not start at login, and the repo ships no LaunchAgent. History has a
-gap for any time it was not running (the charts show the gap).
+`./run` does not start at login, and the repo ships no LaunchAgent for it. The
+Mac app does open at login, and starts the monitor if none is running (see
+[Two ways to run it](#-two-ways-to-run-it)). History has a gap for any time the
+monitor was not running (the charts show the gap).
 
 `./snapshot` takes its own 2 second reading and runs one round of the internet
 checks, so it works when the server is down. It reads the history but adds
@@ -256,9 +330,17 @@ Stop it with Ctrl-C in its terminal, or, if you started it with `nohup`:
 pkill -f "monitor.py serve"
 ```
 
-To uninstall, stop it and delete the folder. The history is in `data/` inside
-that folder (or wherever you pointed `MAC_MONITOR_DB`), so it goes too. Nothing
-else was installed, so there is nothing else to clean up.
+If the Mac app started the monitor, choose Quit in its panel and the monitor
+stops with it. To remove the app and its login item:
+
+```bash
+app/uninstall
+```
+
+To uninstall everything, stop it, run `app/uninstall` if you installed the Mac
+app, and delete the folder. The history is in `data/` inside that folder (or
+wherever you pointed `MAC_MONITOR_DB`), so it goes too. Nothing else was
+installed, so there is nothing else to clean up.
 
 ## 📜 Licence
 
