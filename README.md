@@ -25,7 +25,7 @@ Just want a quick look, with no server at all?
 
 ## ✨ What you get
 
-- 📊 A live dashboard with charts for 15 minutes, 1 hour, 6 hours, 24 hours or 7 days
+- 📊 A live dashboard with charts for 15 minutes, 1 hour, 6 hours, 24 hours, 7 days, 30 days, 1 year or everything recorded
 - 🕵️ The top processes at any moment in the past week, so you can see who was hogging the CPU
 - 🌐 An internet verdict in plain words, which says which side of the router the break is on
 - 🔔 A macOS banner when something goes wrong
@@ -203,7 +203,7 @@ Everything the dashboard shows is also available as JSON:
 
 ```text
 /api/now                         latest sample, live process lists, open events
-/api/history?range=1h            15m | 1h | 6h | 24h | 7d, downsampled to ~360 points or fewer
+/api/history?range=1h            15m | 1h | 6h | 24h | 7d | 30d | 1y | all, downsampled to ~360 points or fewer
 /api/history?range=1h&end=TS     the window ending at a unix time
 /api/events?limit=100&since=TS   events, newest first, with their process lists
 /api/speedtest                   speed test state and last result (POST with header X-Mac-Monitor: 1 starts one)

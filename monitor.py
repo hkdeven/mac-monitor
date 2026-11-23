@@ -89,6 +89,9 @@ RANGES = {
     "6h": (21600, 60),
     "24h": (86400, 240),
     "7d": (604800, 1800),
+    "30d": (2592000, 7200),
+    "1y": (31536000, 86400),
+    "all": (None, None),           # from the first sample to now
 }
 
 PRESSURE_NAMES = {1: "normal", 2: "warn", 4: "critical"}
@@ -1405,6 +1408,10 @@ def query_history(con, rng, end=None):
     span, bucket = RANGES[rng]
     now = int(time.time())
     end = int(end) if end else now
+    if span is None:
+        first = con.execute("SELECT MIN(ts) FROM samples").fetchone()[0] or end
+        span = max(900, end - first + 60)
+        bucket = max(5, -(-span // 360 // 5) * 5)
     start = end - span
     rows = con.execute(
         "SELECT (ts/?)*? AS t, AVG(cpu_user), AVG(cpu_sys), MAX(cpu_user+cpu_sys), AVG(load1),"

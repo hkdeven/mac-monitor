@@ -194,7 +194,7 @@ footer a { color: var(--text-2); }
 
   <section class="toolbar" id="toolbar">
     <div class="seg" id="ranges" role="group" aria-label="Chart time range">
-      <button data-r="15m">15m</button><button data-r="1h">1h</button><button data-r="6h">6h</button><button data-r="24h">24h</button><button data-r="7d">7d</button>
+      <button data-r="15m">15m</button><button data-r="1h">1h</button><button data-r="6h">6h</button><button data-r="24h">24h</button><button data-r="7d">7d</button><button data-r="30d">30d</button><button data-r="1y">1y</button><button data-r="all">All</button>
     </div>
     <div class="view"><span class="spin" id="histSpin"></span><span id="viewText">Live</span>
       <button class="btn" id="backLive" hidden>Back to live</button></div>
@@ -237,9 +237,10 @@ footer a { color: var(--text-2); }
 <script>
 "use strict";
 const $ = id => document.getElementById(id);
-const RANGE_S = {"15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800};
+const RANGE_S = {"15m": 900, "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000, "1y": 31536000, "all": 0};
+function rangeS() { return RANGE_S[state.range] || (state.hist ? state.hist.end - state.hist.start : 604800); }
 const state = { range: "1h", end: null, hist: null, now: null, sort: "cpu", group: false, pin: null, selEvent: null, events: [], hover: null, histToken: 0 };
-try { const r = localStorage.getItem("mm.range"); if (RANGE_S[r]) state.range = r; } catch (e) {}
+try { const r = localStorage.getItem("mm.range"); if (r in RANGE_S) state.range = r; } catch (e) {}
 
 // ---------- formatting ----------
 function fmtBytes(n, digits) {
@@ -253,7 +254,7 @@ function fmtAxisBytes(v) { let n = v, i = 0; while (n >= 1024 && i < 4) { n /= 1
 const fmtPct = n => (n == null ? "-" : (+n).toFixed(n >= 99.95 || n < 10 ? (n >= 99.95 ? 0 : 1) : 0) + "%");
 const pad = n => String(n).padStart(2, "0");
 function fmtClock(ts, secs) { const d = new Date(ts * 1000); return pad(d.getHours()) + ":" + pad(d.getMinutes()) + (secs ? ":" + pad(d.getSeconds()) : ""); }
-function fmtDay(ts) { return new Date(ts * 1000).toLocaleDateString(undefined, {weekday: "short", day: "numeric", month: "short"}); }
+function fmtDay(ts) { const d = new Date(ts * 1000), o = {weekday: "short", day: "numeric", month: "short"}; if (Date.now() - d > 300 * 86400e3) o.year = "numeric"; return d.toLocaleDateString(undefined, o); }
 function fmtWhen(ts, secs) {
   const d = new Date(ts * 1000), n = new Date();
   return (d.toDateString() === n.toDateString() ? "" : fmtDay(ts) + " ") + fmtClock(ts, secs);
@@ -374,13 +375,13 @@ class Chart {
     }
     // x labels
     const span = hist.end - hist.start, maxTicks = Math.max(2, Math.floor(pw / 80));
-    const step = X_STEPS.find(s => span / s <= maxTicks) || 172800;
+    const step = X_STEPS.concat([172800, 604800, 1209600, 2592000, 5184000, 7776000, 15552000]).find(s => span / s <= maxTicks) || 31536000;
     const off = new Date(hist.end * 1000).getTimezoneOffset() * 60;
     c.textBaseline = "alphabetic"; c.textAlign = "center"; c.fillStyle = col("--muted");
     for (let t = Math.ceil((hist.start - off) / step) * step + off; t <= hist.end; t += step) {
       const x = this.xOf(t, g); if (x < g.l + 14 || x > g.w - g.r - 14) continue;
       const d = new Date(t * 1000), midnight = d.getHours() === 0 && d.getMinutes() === 0;
-      c.fillText(step >= 86400 || midnight ? d.toLocaleDateString(undefined, {weekday: "short", day: "numeric"}) : fmtClock(t), x, g.h - 6);
+      c.fillText(step >= 86400 || midnight ? d.toLocaleDateString(undefined, span > 691200 ? {day: "numeric", month: "short"} : {weekday: "short", day: "numeric"}) : fmtClock(t), x, g.h - 6);
     }
 
     // event spans and markers
@@ -524,7 +525,7 @@ function renderView() {
   const h = state.hist, live = state.end == null;
   for (const b of $("ranges").children) b.setAttribute("aria-pressed", String(b.dataset.r === state.range));
   $("backLive").hidden = live && !state.pin;
-  if (state.histLoading) { $("viewText").textContent = "Loading " + state.range + (live ? "" : " around " + fmtWhen(state.end - RANGE_S[state.range] / 2)) + "…"; return; }
+  if (state.histLoading) { $("viewText").textContent = "Loading " + state.range + (live ? "" : " around " + fmtWhen(state.end - rangeS() / 2)) + "…"; return; }
   if (!h) { $("viewText").textContent = ""; return; }
   $("viewText").textContent = (live ? "Live · " : "History · ") + fmtWhen(h.start) + " to " + fmtWhen(h.end) + (h.bucket > 5 ? " · " + fmtDur(h.bucket) + " averages" : "");
 }
@@ -609,7 +610,7 @@ $("ranges").addEventListener("click", e => {
   if (state.end != null && state.pin) state.end = centerEnd(state.pin.ts);
   loadHistory(true);
 });
-function centerEnd(ts) { const e = Math.round(ts + RANGE_S[state.range] / 2); return e >= Date.now() / 1000 - 5 ? null : e; }
+function centerEnd(ts) { const e = Math.round(ts + rangeS() / 2); return e >= Date.now() / 1000 - 5 ? null : e; }
 function backToLive() { state.end = null; state.pin = null; state.selEvent = null; renderEvents(); renderProcs(); loadHistory(true); }
 $("backLive").addEventListener("click", backToLive);
 $("procLive").addEventListener("click", backToLive);
@@ -681,7 +682,7 @@ function renderEvents() {
 }
 function selectEvent(ev) {
   state.selEvent = ev.id;
-  if (RANGE_S[state.range] > 3600) state.range = "1h";
+  if (rangeS() > 3600) state.range = "1h";
   state.end = centerEnd(ev.ts);
   state.pin = {ts: ev.ts, loading: false, label: ev.title, data: Object.assign({ts: ev.ts, cpu: null}, ev.processes)};
   renderEvents(); renderProcs(); loadHistory(true);
@@ -753,8 +754,8 @@ async function tick() {
   }
   ticks++;
   if (ticks % 2 === 0) loadEvents();
-  // refresh the charts no more often than their buckets change (10 s to 60 s)
-  const every = Math.max(2, Math.min(12, Math.round((state.hist ? state.hist.bucket : 10) / 5)));
+  // refresh the charts no more often than their buckets change (10 s to 60 s; 10 min on the 30d, 1y and All ranges)
+  const hb = state.hist ? state.hist.bucket : 10, every = Math.max(2, Math.min(hb > 1800 ? 120 : 12, Math.round(hb / 5)));
   if (ticks % every === 0 && state.end == null && !state.histLoading && !state.hover) loadHistory(false);
 }
 renderView(); renderProcs();
