@@ -31,6 +31,7 @@ struct Now: Decodable {
     struct HTTP: Decodable { let ok: Bool? }
     struct Internet: Decodable {
         let verdict: Verdict
+        let loss: Double?
         let link: Link?
         let gateway: Gateway?
         let dns: DNS?
@@ -62,6 +63,8 @@ final class Monitor {
     private(set) var now: Now?
     private(set) var port: Int?
     private(set) var problem: String?
+    private(set) var lastGood: Date?    // time of the last good read, for the panel header
+    let started = Date()
     var onChange: (() -> Void)?
 
     private let repoPath: String
@@ -166,6 +169,7 @@ final class Monitor {
         attachedToOther = !own
         port = p
         now = n
+        lastGood = Date()
         phase = .live
         problem = nil
         misses = 0

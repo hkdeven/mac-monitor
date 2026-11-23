@@ -76,6 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
         }
         panel.render(monitor)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        // No button starts out ringed as the keyboard focus; Tab still reaches them.
+        panel.view.window?.makeFirstResponder(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
@@ -88,21 +90,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
     /// The menu bar item is always kept current; the panel only while it is open.
     private func refreshViews() {
         let s = monitor.now
-        var level = Level.unknown
+        let level = monitor.level
         var text = "\u{2026}"
         var tip = "Mac Monitor: connecting"
         switch monitor.phase {
         case .connecting, .starting:
             break
         case .down:
-            level = .critical
             text = "--"
             tip = "Mac Monitor: the monitor is not responding"
         case .live:
             let open = s?.active_events ?? []
-            if open.contains(where: { $0.severity == "critical" }) { level = .critical }
-            else if open.contains(where: { $0.severity == "warning" }) { level = .warning }
-            else if s?.ready == true { level = .good }
             if let busy = s?.cpu?.busy {
                 text = String(format: "%.0f%%", busy)
                 let n = open.count
