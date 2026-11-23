@@ -102,7 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSPopoverDelegate {
             let open = s?.active_events ?? []
             if open.contains(where: { $0.severity == "critical" }) { level = .critical }
             else if open.contains(where: { $0.severity == "warning" }) { level = .warning }
-            else { level = .good }
+            else if s?.ready == true { level = .good }
             if let busy = s?.cpu?.busy {
                 text = String(format: "%.0f%%", busy)
                 let n = open.count

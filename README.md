@@ -83,12 +83,18 @@ How the two fit together:
   5180-5199 (or only `MAC_MONITOR_PORT` if you set it). If it finds one, for
   example your `./run`, it shows that one and never stops it.
 - 🐣 If none answers after 10 seconds, the app starts `python3 monitor.py serve`
-  itself from this folder, and stops it again when you choose Quit. Either way
-  there is one monitor and one `data/monitor.db`.
+  itself from this folder, and stops it again when you choose Quit. The aim is
+  one monitor and one `data/monitor.db`, whichever way you look at it.
+- ⏳ If a monitor it found goes quiet, the app waits about 45 seconds before
+  starting its own. It never starts one while something on those ports is slow
+  or failing rather than gone, because that may be a busy monitor.
 - 📁 The app remembers where this folder is from the moment you build it. If
-  you move the folder, run `app/install` again.
-- 🪶 It reads `/api/now` once every 5 seconds and does nothing else. The panel
-  is only redrawn while it is open.
+  you move the folder, run `app/install` again. If you use `MAC_MONITOR_PORT`
+  or `MAC_MONITOR_DB`, set them when you run `app/install` and the app keeps
+  them.
+- 🪶 While it has a monitor it reads `/api/now` once every 5 seconds and does
+  nothing else. While it is looking for one it tries each port once every 5
+  seconds. The panel is only redrawn while it is open.
 - 🔑 The login item is one file,
   `~/Library/LaunchAgents/com.hkdeven.mac-monitor-app.plist`. `app/uninstall`
   removes it.
@@ -331,7 +337,9 @@ pkill -f "monitor.py serve"
 ```
 
 If the Mac app started the monitor, choose Quit in its panel and the monitor
-stops with it. To remove the app and its login item:
+stops with it. While the app is running it starts the monitor again within a
+minute of it stopping, so quit the app as well when you want monitoring off.
+To remove the app and its login item:
 
 ```bash
 app/uninstall

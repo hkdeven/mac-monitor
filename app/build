@@ -5,6 +5,7 @@
 set -eu
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=${MAC_MONITOR_REPO:-$(dirname "$HERE")}
+REPO=$(cd "$REPO" && pwd)
 APP="$HERE/dist/Mac Monitor.app"
 
 if [ ! -f "$REPO/monitor.py" ]; then

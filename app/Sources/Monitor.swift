@@ -45,9 +45,18 @@ final class Monitor {
     enum Phase { case connecting, starting, live, down }
 
     static let portRange = 5180...5199          // PORT_RANGE in monitor.py
-    static let startAfterSilence: TimeInterval = 10      // nothing has ever answered
-    static let restartAfterSilence: TimeInterval = 45    // a monitor we did not start went quiet
+    // Failed reads in a row (one every 5 s) before the app starts its own monitor.
+    // Counted in reads, not clock time, so a Mac waking from sleep is one miss.
+    static let missesBeforeStart = 3        // nothing has ever answered: about 10 s
+    static let missesBeforeRestart = 10     // a monitor we did not start went quiet: about 45 s
     static let retrySpawnAfter: TimeInterval = 30
+
+    private enum Probe {
+        case ok(Now)
+        case free       // nothing is listening on the port
+        case absent     // something else answers there, not a monitor
+        case unclear    // something is there but slow or failing: maybe a busy monitor
+    }
 
     private(set) var phase: Phase = .connecting
     private(set) var now: Now?
@@ -59,9 +68,11 @@ final class Monitor {
     private let ports: [Int]
     private let session: URLSession
     private var busy = false
-    private var silentSince = Date()
+    private var misses = 0
+    private var everLive = false
     private var attachedToOther = false
     private var child: Process?
+    private var childPort: Int?
     private var childStarted: Date?
 
     init(repoPath: String) {
@@ -95,51 +106,79 @@ final class Monitor {
     }
 
     private func refresh() async {
-        if let p = port, let n = await fetch(p) { accept(n, p); return }
-        port = nil
-        for p in ports {
-            if let n = await fetch(p) { accept(n, p); return }
+        let ownRunning = child?.isRunning == true
+        // While our own monitor runs, only its port is read.
+        var scan = ports
+        if ownRunning, let cp = childPort { scan = [cp] }
+        if let p = port, let i = scan.firstIndex(of: p) { scan.swapAt(0, i) }
+        var unclear = false
+        var firstFree: Int?
+        for p in scan {
+            switch await fetch(p) {
+            case .ok(let n): accept(n, p, own: ownRunning); return
+            case .unclear: unclear = true
+            case .free: if firstFree == nil { firstFree = p }
+            case .absent: break
+            }
         }
-        // Nothing answers.
-        let hadData = now != nil
+        // Nothing gave a reading.
+        port = nil
         now = nil
-        let silence = Date().timeIntervalSince(silentSince)
-        if let c = child, c.isRunning, let t = childStarted {
+        let waiting: Phase = (everLive || childStarted != nil) ? .down : .connecting
+        if ownRunning, let t = childStarted {
             phase = Date().timeIntervalSince(t) < 20 ? .starting : .down
             return
         }
-        let wait = attachedToOther ? Monitor.restartAfterSilence : Monitor.startAfterSilence
+        if unclear {
+            // Something holds a port but is slow or failing. It may be a busy
+            // monitor, so never start a second one beside it.
+            misses = 0
+            phase = waiting
+            return
+        }
+        misses += 1
+        let need = attachedToOther ? Monitor.missesBeforeRestart : Monitor.missesBeforeStart
         let lastTry = childStarted.map { Date().timeIntervalSince($0) } ?? .infinity
-        if silence >= wait && lastTry >= Monitor.retrySpawnAfter {
+        if misses >= need && lastTry >= Monitor.retrySpawnAfter, let free = firstFree {
             attachedToOther = false
-            phase = spawn() ? .starting : .down
+            phase = spawn(on: free) ? .starting : .down
         } else {
-            phase = (hadData || attachedToOther || childStarted != nil) ? .down : .connecting
+            phase = waiting
         }
     }
 
-    private func accept(_ n: Now, _ p: Int) {
-        if port != p && !(child?.isRunning ?? false) { attachedToOther = true }
+    private func accept(_ n: Now, _ p: Int, own: Bool) {
+        attachedToOther = !own
         port = p
         now = n
         phase = .live
         problem = nil
-        silentSince = Date()
+        misses = 0
+        everLive = true
     }
 
-    private func fetch(_ p: Int) async -> Now? {
-        guard let url = URL(string: "http://127.0.0.1:\(p)/api/now") else { return nil }
+    private func fetch(_ p: Int) async -> Probe {
+        guard let url = URL(string: "http://127.0.0.1:\(p)/api/now") else { return .absent }
         do {
             let (data, resp) = try await session.data(from: url)
-            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-            return try JSONDecoder().decode(Now.self, from: data)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if code == 200 {
+                if let n = try? JSONDecoder().decode(Now.self, from: data) { return .ok(n) }
+                return .unclear
+            }
+            return code >= 500 ? .unclear : .absent
+        } catch let e as URLError where e.code == .cannotConnectToHost {
+            return .free
         } catch {
-            return nil
+            return .unclear
         }
     }
 
-    /// Starts `python3 monitor.py serve` from the repo, the same way ./run does.
-    private func spawn() -> Bool {
+    /// Starts `python3 monitor.py serve` from the repo, as ./run does, on a port
+    /// the app has just seen free. The port is fixed so that a monitor that is
+    /// only slow to answer keeps it and this one gives up, instead of two
+    /// monitors writing one history.
+    private func spawn(on port: Int) -> Bool {
         childStarted = Date()
         let script = (repoPath as NSString).appendingPathComponent("monitor.py")
         guard FileManager.default.fileExists(atPath: script) else {
@@ -150,6 +189,9 @@ final class Monitor {
         p.executableURL = URL(fileURLWithPath: "/usr/bin/env")
         p.arguments = ["python3", "monitor.py", "serve"]
         p.currentDirectoryURL = URL(fileURLWithPath: repoPath)
+        var env = ProcessInfo.processInfo.environment
+        env["MAC_MONITOR_PORT"] = String(port)
+        p.environment = env
         p.standardInput = FileHandle.nullDevice
         p.standardOutput = FileHandle.nullDevice
         p.standardError = FileHandle.nullDevice
@@ -160,6 +202,7 @@ final class Monitor {
             return false
         }
         child = p
+        childPort = port
         problem = nil
         return true
     }
