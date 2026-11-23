@@ -68,7 +68,7 @@ open "app/dist/Mac Monitor.app"
 If you quit it from its panel, open it again with:
 
 ```bash
-open ~/Applications/Mac\ Monitor.app
+launchctl kickstart gui/$(id -u)/com.hkdeven.mac-monitor-app
 ```
 
 Remove it (the browser option and your history stay as they are):

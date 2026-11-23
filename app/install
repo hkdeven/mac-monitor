@@ -14,6 +14,7 @@ DOMAIN="gui/$(id -u)"
 
 # Stop a copy that is already installed, then replace it.
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+pkill -f "$DEST/Contents/MacOS/Mac Monitor" 2>/dev/null || true
 mkdir -p "$HOME/Applications" "$HOME/Library/LaunchAgents"
 rm -rf "$DEST"
 cp -R "$HERE/dist/Mac Monitor.app" "$DEST"

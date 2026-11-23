@@ -69,6 +69,8 @@ final class Monitor {
     private let session: URLSession
     private var busy = false
     private var misses = 0
+    private var unclearReads = 0
+    private var slipUsed = false
     private var everLive = false
     private var attachedToOther = false
     private var child: Process?
@@ -121,7 +123,12 @@ final class Monitor {
             case .absent: break
             }
         }
-        // Nothing gave a reading.
+        // Nothing gave a reading. One slow read while live keeps the last
+        // reading on show; the next one counts.
+        if phase == .live && !slipUsed {
+            slipUsed = true
+            return
+        }
         port = nil
         now = nil
         let waiting: Phase = (everLive || childStarted != nil) ? .down : .connecting
@@ -133,9 +140,17 @@ final class Monitor {
             // Something holds a port but is slow or failing. It may be a busy
             // monitor, so never start a second one beside it.
             misses = 0
-            phase = waiting
+            unclearReads += 1
+            if unclearReads >= 3 {
+                problem = "Something on this Mac is holding a monitor port but not answering. If it is the monitor, restart it; if not, set MAC_MONITOR_PORT to a free port."
+                phase = .down
+            } else {
+                phase = waiting
+            }
             return
         }
+        if unclearReads > 0 { problem = nil }
+        unclearReads = 0
         misses += 1
         let need = attachedToOther ? Monitor.missesBeforeRestart : Monitor.missesBeforeStart
         let lastTry = childStarted.map { Date().timeIntervalSince($0) } ?? .infinity
@@ -154,6 +169,8 @@ final class Monitor {
         phase = .live
         problem = nil
         misses = 0
+        unclearReads = 0
+        slipUsed = false
         everLive = true
     }
 
@@ -164,7 +181,7 @@ final class Monitor {
             let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
             if code == 200 {
                 if let n = try? JSONDecoder().decode(Now.self, from: data) { return .ok(n) }
-                return .unclear
+                return .absent      // some other program's page
             }
             return code >= 500 ? .unclear : .absent
         } catch let e as URLError where e.code == .cannotConnectToHost {
